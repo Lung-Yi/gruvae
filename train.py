@@ -432,7 +432,8 @@ def main(config_path='train.yaml'):
         hidden_dim=model_config['hidden_dim'],
         latent_dim=model_config['latent_dim'],
         num_layers=model_config['num_layers'],
-        dropout=model_config['dropout']
+        dropout=model_config['dropout'],
+        bidirectional=model_config['bidirectional'],
     )
 
     print(f"模型參數量: {sum(p.numel() for p in model.parameters()):,}")

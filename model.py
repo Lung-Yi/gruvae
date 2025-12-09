@@ -19,7 +19,8 @@ class GRUEncoder(nn.Module):
         hidden_dim: int,
         latent_dim: int,
         num_layers: int = 1,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        bidirectional: bool = True,
     ):
         """
         Args:
@@ -34,6 +35,7 @@ class GRUEncoder(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.bidirectional = bidirectional
 
         # Embedding 層
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
@@ -44,12 +46,20 @@ class GRUEncoder(nn.Module):
             hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=self.bidirectional
         )
+        # --- 修正點 1: 計算正確的輸出維度 ---
+        # 如果是雙向，hidden state 會串接，所以維度是 2 倍
+        self.encoding_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
-        # 潛在空間映射
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        # --- 修正點 2: 使用正確的維度初始化 Batch Normalization ---
+        self.bn = nn.BatchNorm1d(self.encoding_output_dim)
+
+        # --- 修正點 3: 使用正確的維度初始化 Linear 層 ---
+        # 這裡原本寫 hidden_dim，導致輸入形狀錯誤
+        self.fc_mu = nn.Linear(self.encoding_output_dim, latent_dim)
+        self.fc_logvar = nn.Linear(self.encoding_output_dim, latent_dim)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -66,9 +76,20 @@ class GRUEncoder(nn.Module):
         # GRU encoding
         _, hidden = self.gru(embedded)  # hidden: [num_layers, batch_size, hidden_dim]
 
-        # 使用最後一層的隱藏狀態
-        h = hidden[-1]  # [batch_size, hidden_dim]
-
+        # 修改 4: 處理雙向 GRU 的 Hidden State
+        if self.bidirectional:
+            # hidden 的結構是 [Layer1_Fwd, Layer1_Bwd, Layer2_Fwd, Layer2_Bwd, ...]
+            # 我們需要最後一層(Layer 3) 的 Forward 和 Backward
+            # Forward 是倒數第二個 (-2), Backward 是倒數第一個 (-1)
+            h_forward = hidden[-2] # [batch_size, hidden_dim]
+            h_backward = hidden[-1] # [batch_size, hidden_dim]
+            h = torch.cat([h_forward, h_backward], dim=1) # [batch_size, hidden_dim * 2]
+        else:
+            # 使用最後一層的隱藏狀態
+            h = hidden[-1]  # [batch_size, hidden_dim]
+        
+        # 通過 Batch Normalization
+        h = self.bn(h)
         # 映射到潛在空間
         mu = self.fc_mu(h)  # [batch_size, latent_dim]
         logvar = self.fc_logvar(h)  # [batch_size, latent_dim]
@@ -118,6 +139,9 @@ class GRUDecoder(nn.Module):
             dropout=dropout if num_layers > 1 else 0
         )
 
+        # 加入 Batch Normalization
+        self.bn = nn.BatchNorm1d(hidden_dim)
+
         # 輸出層
         self.fc_out = nn.Linear(hidden_dim, vocab_size)
 
@@ -148,6 +172,13 @@ class GRUDecoder(nn.Module):
             # Teacher forcing: 使用真實的目標序列作為輸入
             embedded = self.embedding(target)  # [batch_size, seq_len, embedding_dim]
             output, _ = self.gru(embedded, h)  # [batch_size, seq_len, hidden_dim]
+
+            # 修改: 應用 Batch Normalization 到序列輸出
+            # BatchNorm1d 需要輸入 [Batch, Dim, Seq]，所以需要 permute
+            output = output.permute(0, 2, 1) # [batch_size, hidden_dim, seq_len]
+            output = self.bn(output)
+            output = output.permute(0, 2, 1) # [batch_size, seq_len, hidden_dim]
+
             output = self.fc_out(output)  # [batch_size, seq_len, vocab_size]
         else:
             # 自回歸生成：一步一步生成
@@ -157,6 +188,13 @@ class GRUDecoder(nn.Module):
             for t in range(seq_len):
                 embedded = self.embedding(input_token)  # [batch_size, 1, embedding_dim]
                 output, h = self.gru(embedded, h)  # output: [batch_size, 1, hidden_dim]
+
+                # 修改: 應用 Batch Normalization (針對單個時間步)
+                # Reshape 為 [Batch, Dim, 1] 進行 BN
+                output = output.permute(0, 2, 1)
+                output = self.bn(output)
+                output = output.permute(0, 2, 1)
+
                 output = self.fc_out(output)  # [batch_size, 1, vocab_size]
 
                 outputs.append(output)
@@ -179,7 +217,8 @@ class GRUVAE(nn.Module):
         hidden_dim: int = 512,
         latent_dim: int = 128,
         num_layers: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        bidirectional: bool = True,
     ):
         """
         Args:
@@ -201,7 +240,8 @@ class GRUVAE(nn.Module):
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             num_layers=num_layers,
-            dropout=dropout
+            dropout=dropout,
+            bidirectional=bidirectional,
         )
 
         # Decoder

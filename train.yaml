@@ -11,19 +11,20 @@ model:
   embedding_dim: 256
   hidden_dim: 512
   latent_dim: 128
-  num_layers: 2
+  num_layers: 3
   dropout: 0.1
+  bidirectional: true
 
 # 訓練參數
 training:
   num_epochs: 150
-  batch_size: 64
-  learning_rate: 0.001
+  batch_size: 128
+  learning_rate: 0.00075
   num_workers: 0
 
   # KL Annealing 設定
   kl_weight_start: 0.0
-  kl_weight_end: 0.1
+  kl_weight_end: 0.01
   kl_anneal_epochs: 100
 
   # 梯度裁剪
@@ -36,7 +37,7 @@ validation:
 
 # 檢查點設定
 checkpoint:
-  save_dir: './checkpoints'
+  save_dir: './checkpoints_3'
   save_interval: 5     # 每幾個 epoch 保存一次
 
 # 設備設定
