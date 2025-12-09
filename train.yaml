@@ -1,0 +1,47 @@
+# GRU-VAE 訓練配置檔案
+
+# 資料設定
+data:
+  train_csv: './data/train_processed.csv'
+  train_split: 0.9  # 訓練集比例
+  max_length: 100   # 最大序列長度
+
+# 模型架構
+model:
+  embedding_dim: 256
+  hidden_dim: 512
+  latent_dim: 128
+  num_layers: 2
+  dropout: 0.1
+
+# 訓練參數
+training:
+  num_epochs: 20
+  batch_size: 64
+  learning_rate: 0.001
+  num_workers: 0
+
+  # KL Annealing 設定
+  kl_weight_start: 0.0
+  kl_weight_end: 0.1
+  kl_anneal_epochs: 10
+
+  # 梯度裁剪
+  grad_clip_max_norm: 1.0
+
+# 驗證設定
+validation:
+  num_reconstruct: 10  # 顯示多少個重建範例
+  num_sample: 10       # 顯示多少個採樣分子
+
+# 檢查點設定
+checkpoint:
+  save_dir: './checkpoints'
+  save_interval: 5     # 每幾個 epoch 保存一次
+
+# 設備設定
+device:
+  use_cuda: true       # 如果可用，使用 CUDA
+
+# 隨機種子
+seed: 42

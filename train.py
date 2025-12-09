@@ -4,6 +4,8 @@ GRU-VAE 訓練腳本
 """
 
 import os
+import yaml
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,7 +18,8 @@ import random
 from tokenizer import SmilesTokenizer, canonicalize_smiles
 from dataset import get_dataloader, SmilesVAEDataset, collate_fn
 from model import GRUVAE, compute_loss
-
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')
 
 class Trainer:
     """GRU-VAE 訓練器"""
@@ -32,7 +35,11 @@ class Trainer:
         kl_weight_start: float = 0.0,
         kl_weight_end: float = 1.0,
         kl_anneal_epochs: int = 10,
-        save_dir: str = './checkpoints'
+        save_dir: str = './checkpoints',
+        grad_clip_max_norm: float = 1.0,
+        save_interval: int = 5,
+        num_reconstruct: int = 10,
+        num_sample: int = 10
     ):
         self.model = model.to(device)
         self.tokenizer = tokenizer
@@ -41,6 +48,10 @@ class Trainer:
         self.device = device
         self.save_dir = save_dir
         self.lr = lr
+        self.grad_clip_max_norm = grad_clip_max_norm
+        self.save_interval = save_interval
+        self.num_reconstruct = num_reconstruct
+        self.num_sample = num_sample
 
         # KL annealing 參數
         self.kl_weight_start = kl_weight_start
@@ -113,7 +124,7 @@ class Trainer:
             # 反向傳播
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_max_norm)
             self.optimizer.step()
 
             # 統計
@@ -140,8 +151,10 @@ class Trainer:
             'kl': avg_kl
         }
 
-    def validate(self, epoch: int, num_reconstruct: int = 10, num_sample: int = 10) -> dict:
+    def validate(self, epoch: int) -> dict:
         """驗證並顯示重建和採樣結果"""
+        num_reconstruct = self.num_reconstruct
+        num_sample = self.num_sample
         self.model.eval()
 
         total_loss = 0
@@ -322,7 +335,7 @@ class Trainer:
                 print(f"  ✓ Best model saved!")
 
             # 定期保存
-            if epoch % 5 == 0:
+            if epoch % self.save_interval == 0:
                 self.save_checkpoint(epoch, f'checkpoint_epoch_{epoch}.pt')
 
             print()
@@ -339,14 +352,28 @@ class Trainer:
         torch.save(checkpoint, path)
 
 
-def main():
+def load_config(config_path):
+    """載入 YAML 配置檔案"""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def main(config_path='train.yaml'):
+    # 載入配置
+    print(f"載入配置檔案: {config_path}")
+    config = load_config(config_path)
+    print(f"配置載入成功!\n")
+
     # 設置隨機種子
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    seed = config['seed']
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     # 設備
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_cuda = config['device']['use_cuda']
+    device = torch.device('cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu')
     print(f"使用設備: {device}\n")
 
     # 建立 tokenizer
@@ -354,70 +381,97 @@ def main():
     tokenizer = SmilesTokenizer()
 
     # 從 CSV 讀取並建立詞彙表
-    df = pd.read_csv('./data/train_processed.csv')
+    train_csv = config['data']['train_csv']
+    df = pd.read_csv(train_csv)
     smiles_list = df['smiles'].tolist()
     tokenizer.build_vocab(smiles_list)
 
     # 保存 tokenizer
-    tokenizer.save('./checkpoints/tokenizer.json')
+    save_dir = config['checkpoint']['save_dir']
+    os.makedirs(save_dir, exist_ok=True)
+    tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
 
     # 分割訓練/驗證集
     print("\n建立 Dataset...")
-    dataset = SmilesVAEDataset('./data/train_processed.csv', tokenizer, max_length=100)
+    max_length = config['data']['max_length']
+    dataset = SmilesVAEDataset(train_csv, tokenizer, max_length=max_length)
 
-    train_size = int(0.9 * len(dataset))
+    train_split = config['data']['train_split']
+    train_size = int(train_split * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
     print(f"訓練集: {len(train_dataset)}, 驗證集: {len(val_dataset)}")
 
     # 建立 DataLoader
+    batch_size = config['training']['batch_size']
+    num_workers = config['training']['num_workers']
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=64,
+        batch_size=batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=100),
-        num_workers=0
+        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length),
+        num_workers=num_workers
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=64,
+        batch_size=batch_size,
         shuffle=False,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=100),
-        num_workers=0
+        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length),
+        num_workers=num_workers
     )
 
     # 建立模型
     print("\n建立模型...")
+    model_config = config['model']
     model = GRUVAE(
         vocab_size=tokenizer.vocab_size,
-        embedding_dim=256,
-        hidden_dim=512,
-        latent_dim=128,
-        num_layers=2,
-        dropout=0.1
+        embedding_dim=model_config['embedding_dim'],
+        hidden_dim=model_config['hidden_dim'],
+        latent_dim=model_config['latent_dim'],
+        num_layers=model_config['num_layers'],
+        dropout=model_config['dropout']
     )
 
     print(f"模型參數量: {sum(p.numel() for p in model.parameters()):,}")
 
     # 建立訓練器
+    training_config = config['training']
+    validation_config = config['validation']
+    checkpoint_config = config['checkpoint']
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        lr=1e-3,
-        kl_weight_start=0.0,    # KL weight 從 0 開始
-        kl_weight_end=0.1,       # 逐漸增加到 0.1
-        kl_anneal_epochs=10,     # 在 10 個 epochs 內線性增加
-        save_dir='./checkpoints'
+        lr=training_config['learning_rate'],
+        kl_weight_start=training_config['kl_weight_start'],
+        kl_weight_end=training_config['kl_weight_end'],
+        kl_anneal_epochs=training_config['kl_anneal_epochs'],
+        grad_clip_max_norm=training_config['grad_clip_max_norm'],
+        save_dir=save_dir,
+        save_interval=checkpoint_config['save_interval'],
+        num_reconstruct=validation_config['num_reconstruct'],
+        num_sample=validation_config['num_sample']
     )
 
     # 開始訓練
-    trainer.train(num_epochs=20)
+    num_epochs = training_config['num_epochs']
+    trainer.train(num_epochs=num_epochs)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='GRU-VAE 訓練腳本')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='train.yaml',
+        help='訓練配置檔案路徑 (default: train.yaml)'
+    )
+    args = parser.parse_args()
+
+    main(config_path=args.config)

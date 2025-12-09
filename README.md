@@ -22,17 +22,20 @@
 ```
 gruvae/
 ├── README.md                   # 專案說明文檔
-├── tokenizer.py               # SMILES 分詞器
-├── dataset.py                 # Dataset 和 DataLoader
-├── model.py                   # GRU-VAE 模型架構
-├── train.py                   # 訓練腳本
-├── process_smiles.py          # 資料預處理腳本
+├── CONFIG_GUIDE.md             # 配置檔案使用指南
+├── UPDATES.md                  # 更新記錄
+├── train.yaml                  # 訓練配置檔案
+├── tokenizer.py                # SMILES 分詞器
+├── dataset.py                  # Dataset 和 DataLoader
+├── model.py                    # GRU-VAE 模型架構
+├── train.py                    # 訓練腳本
+├── process_smiles.py           # 資料預處理腳本
 ├── data/
-│   ├── train.txt              # 原始訓練資料
-│   └── train_processed.csv    # 處理後的資料
+│   ├── train.txt               # 原始訓練資料
+│   └── train_processed.csv     # 處理後的資料
 └── checkpoints/
-    ├── tokenizer.json         # 保存的 tokenizer
-    └── best_model.pt          # 最佳模型檢查點
+    ├── tokenizer.json          # 保存的 tokenizer
+    └── best_model.pt           # 最佳模型檢查點
 ```
 
 ## 環境需求
@@ -85,16 +88,26 @@ python process_smiles.py
 
 ### 2. 訓練模型
 
+#### 使用預設配置訓練
+
 ```bash
 python train.py
 ```
 
+#### 使用自訂配置訓練
+
+```bash
+python train.py --config my_config.yaml
+```
+
 訓練過程中會：
+- 載入 YAML 配置檔案
 - 自動建立並保存 tokenizer
 - 每個 epoch 結束後進行驗證
-- 顯示 10 個分子重建結果
-- 顯示 10 個從潛在空間採樣的新分子
-- 自動保存最佳模型到 `./checkpoints/best_model.pt`
+- 顯示分子重建結果和採樣結果
+- 自動保存最佳模型到配置指定的目錄
+
+詳細的配置說明請參考 [CONFIG_GUIDE.md](CONFIG_GUIDE.md)
 
 ### 3. 監控訓練
 
