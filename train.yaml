@@ -2,18 +2,29 @@
 
 # 資料設定
 data:
-  train_csv: './data/train_processed.csv'
+  train_csv: './data/train_small_processed.csv'
   train_split: 0.9  # 訓練集比例
   max_length: 100   # 最大序列長度
 
 # 模型架構
 model:
-  embedding_dim: 256
-  hidden_dim: 512
-  latent_dim: 128
-  num_layers: 3
-  dropout: 0.1
-  bidirectional: true
+  # model_type: 'gru'  # 'gru' 或 'transformer'
+  # # GRU 模型參數
+  # embedding_dim: 256
+  # hidden_dim: 512
+  # latent_dim: 128
+  # num_layers: 3
+  # dropout: 0.1
+  # bidirectional: true
+
+  model_type: 'transformer'
+  # Transformer 模型參數（當 model_type='transformer' 時使用）
+  d_model: 512
+  nhead: 8
+  num_encoder_layers: 8
+  num_decoder_layers: 6
+  dim_feedforward: 2048
+  max_len: 128
 
 # 訓練參數
 training:
@@ -37,7 +48,7 @@ validation:
 
 # 檢查點設定
 checkpoint:
-  save_dir: './checkpoints_large'
+  save_dir: './checkpoints_transformer'
   save_interval: 5     # 每幾個 epoch 保存一次
 
 # 設備設定

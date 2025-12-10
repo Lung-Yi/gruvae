@@ -18,19 +18,21 @@ import random
 from tokenizer import SmilesTokenizer, canonicalize_smiles
 from dataset import get_dataloader, SmilesVAEDataset, collate_fn
 from model import GRUVAE, compute_loss
+from transformer_model import TransformerVAE
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 class Trainer:
-    """GRU-VAE 訓練器"""
+    """VAE 訓練器（支援 GRU 和 Transformer）"""
 
     def __init__(
         self,
-        model: GRUVAE,
+        model,  # GRUVAE 或 TransformerVAE
         tokenizer: SmilesTokenizer,
         train_loader: DataLoader,
         val_loader: DataLoader,
         device: torch.device,
+        model_type: str = 'gru',  # 'gru' 或 'transformer'
         lr: float = 1e-3,
         kl_weight_start: float = 0.0,
         kl_weight_end: float = 1.0,
@@ -46,6 +48,7 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.model_type = model_type.lower()
         self.save_dir = save_dir
         self.lr = lr
         self.grad_clip_max_norm = grad_clip_max_norm
@@ -78,6 +81,30 @@ class Trainer:
             'lr': []
         }
 
+    def create_masks(self, encoder_input, decoder_input):
+        """
+        為 Transformer 模型創建 masks
+
+        Args:
+            encoder_input: [batch_size, seq_len]
+            decoder_input: [batch_size, seq_len]
+
+        Returns:
+            src_key_padding_mask, tgt_key_padding_mask, tgt_mask
+        """
+        if self.model_type != 'transformer':
+            return None, None, None
+
+        # Padding mask: True 表示該位置是 padding，需要被 mask
+        src_key_padding_mask = (encoder_input == self.tokenizer.pad_idx)
+        tgt_key_padding_mask = (decoder_input == self.tokenizer.pad_idx)
+
+        # Causal mask: 防止 decoder 看到未來的 token
+        seq_len = decoder_input.size(1)
+        tgt_mask = self.model.generate_square_subsequent_mask(seq_len).to(self.device)
+
+        return src_key_padding_mask, tgt_key_padding_mask, tgt_mask
+
     def get_kl_weight(self, epoch: int) -> float:
         """計算當前 epoch 的 KL weight（線性 annealing）"""
         if epoch > self.kl_anneal_epochs:
@@ -105,11 +132,26 @@ class Trainer:
             decoder_target = decoder_target.to(self.device)
 
             # 前向傳播（使用 teacher forcing）
-            output, mu, logvar = self.model(
-                encoder_input,
-                decoder_input,
-                teacher_forcing=True
-            )
+            if self.model_type == 'transformer':
+                # Transformer 需要額外的 masks
+                src_key_padding_mask, tgt_key_padding_mask, tgt_mask = self.create_masks(
+                    encoder_input, decoder_input
+                )
+                output, mu, logvar = self.model(
+                    encoder_input,
+                    decoder_input,
+                    src_key_padding_mask=src_key_padding_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    tgt_mask=tgt_mask,
+                    teacher_forcing=True
+                )
+            else:
+                # GRU 模型
+                output, mu, logvar = self.model(
+                    encoder_input,
+                    decoder_input,
+                    teacher_forcing=True
+                )
 
             # 計算損失（使用當前的 KL weight）
             loss, recon_loss, kl_loss = compute_loss(
@@ -178,11 +220,27 @@ class Trainer:
                 decoder_target = decoder_target.to(self.device)
 
                 # 前向傳播（不使用 teacher forcing）
-                output, mu, logvar = self.model(
-                    encoder_input,
-                    decoder_input,
-                    teacher_forcing=False
-                )
+                if self.model_type == 'transformer':
+                    # Transformer 需要額外的 masks
+                    # 注意：validation 時不使用 teacher forcing，但仍需要 masks
+                    src_key_padding_mask = (encoder_input == self.tokenizer.pad_idx)
+                    # 對於非 teacher forcing 模式，不需要 tgt_key_padding_mask 和 tgt_mask
+                    # 因為模型內部會自回歸生成
+                    output, mu, logvar = self.model(
+                        encoder_input,
+                        decoder_input,
+                        src_key_padding_mask=src_key_padding_mask,
+                        tgt_key_padding_mask=None,
+                        tgt_mask=None,
+                        teacher_forcing=False
+                    )
+                else:
+                    # GRU 模型
+                    output, mu, logvar = self.model(
+                        encoder_input,
+                        decoder_input,
+                        teacher_forcing=False
+                    )
 
                 # 計算損失（使用當前的 KL weight）
                 loss, recon_loss, kl_loss = compute_loss(
@@ -426,16 +484,39 @@ def main(config_path='train.yaml'):
     # 建立模型
     print("\n建立模型...")
     model_config = config['model']
-    model = GRUVAE(
-        vocab_size=tokenizer.vocab_size,
-        embedding_dim=model_config['embedding_dim'],
-        hidden_dim=model_config['hidden_dim'],
-        latent_dim=model_config['latent_dim'],
-        num_layers=model_config['num_layers'],
-        dropout=model_config['dropout'],
-        bidirectional=model_config['bidirectional'],
-    )
+    model_type = model_config.get('model_type', 'gru').lower()
 
+    if model_type == 'transformer':
+        print("使用 Transformer VAE 模型")
+        model = TransformerVAE(
+            vocab_size=tokenizer.vocab_size,
+            d_model=model_config.get('d_model', 512),
+            nhead=model_config.get('nhead', 8),
+            num_encoder_layers=model_config.get('num_encoder_layers', 8),
+            num_decoder_layers=model_config.get('num_decoder_layers', 6),
+            dim_feedforward=model_config.get('dim_feedforward', 2048),
+            latent_dim=model_config.get('latent_dim', 128),
+            dropout=model_config.get('dropout', 0.1),
+            max_len=model_config.get('max_len', 128),
+            pad_idx=tokenizer.pad_idx,
+            start_idx=tokenizer.start_idx,
+            end_idx=tokenizer.end_idx
+        )
+    elif model_type == 'gru':
+        print("使用 GRU VAE 模型")
+        model = GRUVAE(
+            vocab_size=tokenizer.vocab_size,
+            embedding_dim=model_config['embedding_dim'],
+            hidden_dim=model_config['hidden_dim'],
+            latent_dim=model_config['latent_dim'],
+            num_layers=model_config['num_layers'],
+            dropout=model_config['dropout'],
+            bidirectional=model_config['bidirectional'],
+        )
+    else:
+        raise ValueError(f"不支援的模型類型: {model_type}，請使用 'gru' 或 'transformer'")
+
+    print(f"模型類型: {model_type.upper()}")
     print(f"模型參數量: {sum(p.numel() for p in model.parameters()):,}")
 
     # 建立訓練器
@@ -449,6 +530,7 @@ def main(config_path='train.yaml'):
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
+        model_type=model_type,
         lr=training_config['learning_rate'],
         kl_weight_start=training_config['kl_weight_start'],
         kl_weight_end=training_config['kl_weight_end'],
