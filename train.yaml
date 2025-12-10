@@ -37,7 +37,7 @@ validation:
 
 # 檢查點設定
 checkpoint:
-  save_dir: './checkpoints_3'
+  save_dir: './checkpoints_large'
   save_interval: 5     # 每幾個 epoch 保存一次
 
 # 設備設定
