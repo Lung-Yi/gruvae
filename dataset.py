@@ -11,12 +11,17 @@ from typing import List, Tuple, Optional
 from tokenizer import SmilesTokenizer, randomize_smiles, canonicalize_smiles
 
 def pad_to_len(seq, max_len, pad_id):
+    """Pad or truncate sequence to max_len. Accepts both list and tensor."""
+    # Convert to list if tensor
+    if isinstance(seq, torch.Tensor):
+        seq = seq.tolist()
+
+    # Truncate if too long
     if len(seq) >= max_len:
         return seq[:max_len]
-    return torch.cat([
-        seq,
-        torch.full((max_len - len(seq),), pad_id, dtype=seq.dtype)
-    ])
+
+    # Pad if too short
+    return seq + [pad_id] * (max_len - len(seq))
 
 class SmilesVAEDataset(Dataset):
     """SMILES VAE Dataset"""

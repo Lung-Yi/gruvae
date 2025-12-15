@@ -28,7 +28,7 @@ model:
 
 # 訓練參數
 training:
-  num_epochs: 3
+  num_epochs: 50
   batch_size: 128
   learning_rate: 0.00035
   num_workers: 0
@@ -36,7 +36,7 @@ training:
   # KL Annealing 設定
   kl_weight_start: 0.0
   kl_weight_end: 0.01
-  kl_anneal_epochs: 100
+  kl_anneal_epochs: 50
 
   # 梯度裁剪
   grad_clip_max_norm: 1.0

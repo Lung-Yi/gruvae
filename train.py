@@ -19,6 +19,7 @@ from tokenizer import SmilesTokenizer, canonicalize_smiles
 from dataset import get_dataloader, SmilesVAEDataset, collate_fn
 from model import GRUVAE, compute_loss
 from transformer_model import TransformerVAE
+from molecule_generator import VAEMoleculeGenerator
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
@@ -332,6 +333,103 @@ class Trainer:
             smiles = self.tokenizer.decode(samples[i].cpu().tolist())
             print(f"[{i+1}] {smiles}")
 
+        print(f"{'='*80}\n")
+
+        # 使用 VAEMoleculeGenerator 進行測試
+        print(f"{'='*80}")
+        print(f"Testing VAEMoleculeGenerator (Epoch {epoch}):")
+        print(f"{'='*80}\n")
+
+        # 創建 VAEMoleculeGenerator 實例(使用當前訓練中的模型)
+        generator = VAEMoleculeGenerator(
+            tokenizer=self.tokenizer,
+            max_length=max_length,
+            model=self.model,
+            device=self.device
+        )
+
+        # 測試 1: 比較 reconstruct_molecules 與原始 reconstruct_examples
+        print(f"{'='*80}")
+        print(f"Test 1: Comparing reconstruct_molecules with original method")
+        print(f"{'='*80}")
+
+        # 收集測試樣本的 SMILES
+        test_smiles_list = [ex['target'] for ex in reconstruct_examples[:min(5, len(reconstruct_examples))]]
+
+        if len(test_smiles_list) > 0:
+            # 使用 VAEMoleculeGenerator 重建
+            generator_results = generator.reconstruct_molecules(test_smiles_list)
+
+            # 比較結果
+            print("\nComparison of reconstruction results:")
+            all_match = True
+            for i, (orig_ex, gen_result) in enumerate(zip(reconstruct_examples[:len(test_smiles_list)], generator_results), 1):
+                orig_match = (orig_ex['target_canonical'] == orig_ex['pred_canonical'])
+                gen_match = gen_result['match']
+
+                # 檢查兩種方法的重建結果是否一致
+                results_consistent = (orig_ex['pred_canonical'] == gen_result['reconstructed_canonical'])
+
+                print(f"\n[{i}] Original SMILES: {orig_ex['target']}")
+                print(f"    Original method reconstruction:  {orig_ex['reconstructed']}")
+                print(f"    Generator method reconstruction: {gen_result['reconstructed']}")
+                print(f"    Original canonical:  {orig_ex['pred_canonical']}")
+                print(f"    Generator canonical: {gen_result['reconstructed_canonical']}")
+                print(f"    Results consistent: {'✓' if results_consistent else '✗'}")
+
+                if not results_consistent:
+                    all_match = False
+                    print(f"    ⚠ WARNING: Inconsistent results between methods!")
+
+            print(f"\n{'='*60}")
+            if all_match:
+                print("✓ All reconstruction results are consistent!")
+            else:
+                print("✗ Some reconstruction results are inconsistent!")
+            print(f"{'='*60}\n")
+
+        # 測試 2: 使用 VAEMoleculeGenerator 隨機採樣
+        print(f"{'='*80}")
+        print(f"Test 2: Sample molecules using VAEMoleculeGenerator")
+        print(f"{'='*80}")
+
+        num_generator_samples = 5
+        generator_samples = generator.sample_molecules(num_generator_samples)
+
+        print("Generated molecules from VAEMoleculeGenerator:")
+        for i, smiles in enumerate(generator_samples, 1):
+            canonical = canonicalize_smiles(smiles)
+            print(f"[{i}] {smiles}")
+            print(f"    (Canonical: {canonical})")
+        print()
+
+        # 測試 3: 分子插值
+        if len(test_smiles_list) >= 2:
+            print(f"{'='*80}")
+            print(f"Test 3: Interpolate between two molecules")
+            print(f"{'='*80}")
+
+            smiles1 = test_smiles_list[0]
+            smiles2 = test_smiles_list[1]
+            num_interp_steps = 5
+
+            print(f"Interpolating between:")
+            print(f"  Start: {smiles1} ({canonicalize_smiles(smiles1)})")
+            print(f"  End:   {smiles2} ({canonicalize_smiles(smiles2)})")
+            print(f"  Steps: {num_interp_steps}\n")
+
+            interpolated = generator.interpolate_molecules(smiles1, smiles2, num_interp_steps)
+
+            print("Interpolation results:")
+            for i, smiles in enumerate(interpolated):
+                alpha = i / (num_interp_steps - 1) if num_interp_steps > 1 else 0
+                canonical = canonicalize_smiles(smiles)
+                print(f"[{i}] α={alpha:.2f}: {smiles}")
+                print(f"              (Canonical: {canonical})")
+            print()
+
+        print(f"{'='*80}")
+        print(f"VAEMoleculeGenerator Testing Complete!")
         print(f"{'='*80}\n")
 
         return {

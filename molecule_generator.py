@@ -9,6 +9,7 @@ import torch
 import numpy as np
 from typing import List, Tuple, Dict
 from tokenizer import SmilesTokenizer, canonicalize_smiles
+from dataset import collate_fn, pad_to_len
 from model import GRUVAE
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -18,18 +19,28 @@ class VAEMoleculeGenerator:
 
     def __init__(
         self,
-        config_path: str,
-        tokenizer_path: str,
-        checkpoint_path: str,
+        tokenizer,
+        max_length: int,
+        model=None,
+        config_path: str = None,
+        tokenizer_path: str = None,
+        checkpoint_path: str = None,
         device: str = None
     ):
         """
         初始化 VAE 分子生成器
 
+        支援兩種初始化模式:
+        1. 使用已有的模型實例 (用於訓練過程中)
+        2. 從檢查點載入 (用於獨立使用)
+
         Args:
-            config_path: 配置檔案路徑 (train.yaml)
-            tokenizer_path: tokenizer 檔案路徑 (tokenizer.json)
-            checkpoint_path: 模型檢查點路徑 (.pt)
+            tokenizer: SmilesTokenizer 實例
+            max_length: 最大序列長度
+            model: (可選) 已有的模型實例。如果提供,則不需要 config_path 和 checkpoint_path
+            config_path: (可選) 配置檔案路徑 (train.yaml)
+            tokenizer_path: (可選) tokenizer 檔案路徑 (tokenizer.json)
+            checkpoint_path: (可選) 模型檢查點路徑 (.pt)
             device: 運算設備 ('cuda' 或 'cpu'，預設自動偵測)
         """
         # 設置設備
@@ -38,41 +49,63 @@ class VAEMoleculeGenerator:
         else:
             self.device = torch.device(device)
 
-        print(f"使用設備: {self.device}")
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-        # 載入配置
-        print(f"載入配置檔案: {config_path}")
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
+        # 模式1: 使用已有的模型實例
+        if model is not None:
+            print(f"使用已有的模型實例")
+            self.model = model
+            self.model.to(self.device)
+            self.config = None
+            print("✓ VAE 分子生成器初始化完成 (使用已有模型)!\n")
 
-        # 載入 tokenizer
-        print(f"載入 tokenizer: {tokenizer_path}")
-        self.tokenizer = SmilesTokenizer()
-        self.tokenizer.load(tokenizer_path)
+        # 模式2: 從檢查點載入
+        elif config_path is not None and checkpoint_path is not None:
+            print(f"使用設備: {self.device}")
 
-        # 建立模型
-        print("建立模型...")
-        model_config = self.config['model']
-        self.model = GRUVAE(
-            vocab_size=self.tokenizer.vocab_size,
-            embedding_dim=model_config['embedding_dim'],
-            hidden_dim=model_config['hidden_dim'],
-            latent_dim=model_config['latent_dim'],
-            num_layers=model_config['num_layers'],
-            dropout=model_config['dropout']
-        )
+            # 載入配置
+            print(f"載入配置檔案: {config_path}")
+            with open(config_path, 'r', encoding='utf-8') as f:
+                self.config = yaml.safe_load(f)
 
-        # 載入模型權重
-        print(f"載入模型權重: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(self.device)
-        self.model.eval()
+            # 如果提供了 tokenizer_path，則重新載入 tokenizer
+            if tokenizer_path is not None:
+                print(f"載入 tokenizer: {tokenizer_path}")
+                self.tokenizer = SmilesTokenizer()
+                self.tokenizer.load(tokenizer_path)
 
-        # 獲取配置參數
-        self.max_length = self.config['data']['max_length']
+            # 建立模型
+            print("建立模型...")
+            model_config = self.config['model']
+            self.model = GRUVAE(
+                vocab_size=self.tokenizer.vocab_size,
+                embedding_dim=model_config['embedding_dim'],
+                hidden_dim=model_config['hidden_dim'],
+                latent_dim=model_config['latent_dim'],
+                num_layers=model_config['num_layers'],
+                dropout=model_config['dropout'],
+                bidirectional=model_config.get('bidirectional', False)
+            )
 
-        print("✓ VAE 分子生成器初始化完成!\n")
+            # 載入模型權重
+            print(f"載入模型權重: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(self.device)
+            self.model.eval()
+
+            # 獲取配置參數
+            self.max_length = self.config['data']['max_length']
+
+            print("✓ VAE 分子生成器初始化完成 (從檢查點載入)!\n")
+
+        else:
+            raise ValueError(
+                "必須提供以下其中一種:\n"
+                "  1. model (已有的模型實例)\n"
+                "  2. config_path + checkpoint_path (從檢查點載入)"
+            )
 
     def sample_molecules(self, num_samples: int) -> List[str]:
         """
@@ -126,9 +159,22 @@ class VAEMoleculeGenerator:
 
         with torch.no_grad():
             for smiles in smiles_list:
+                encoder_input, _decoder_input, decoder_target = collate_fn([(smiles, smiles)], tokenizer=self.tokenizer, max_length=self.max_length)
+
                 # 編碼輸入
                 input_indices = self.tokenizer.encode(smiles, add_special_tokens=True)
-                input_tensor = torch.tensor([input_indices], dtype=torch.long).to(self.device)
+                input_tensor = torch.tensor(input_indices, dtype=torch.long).to(self.device)
+                input_tensor = pad_to_len(input_tensor, self.max_length, self.tokenizer.pad_idx)
+                # print("input_tensor")
+                # print(input_tensor)
+                input_tensor = torch.tensor([input_tensor], dtype=torch.long).to(self.device)
+
+                encoder_input = torch.tensor(encoder_input, dtype=torch.long).to(self.device)
+                # decoder_input = torch.tensor(decoder_input, dtype=torch.long).to(self.device)
+                # print("encoder_input")
+                # print(encoder_input)
+                # print("input_tensor")
+                # print(input_tensor)
 
                 # 創建 decoder 輸入（僅 START token）
                 decoder_input = torch.full(
@@ -139,7 +185,7 @@ class VAEMoleculeGenerator:
 
                 # 前向傳播（不使用 teacher forcing）
                 output, mu, logvar = self.model(
-                    input_tensor,
+                    input_tensor, # input_tensor
                     decoder_input,
                     teacher_forcing=False
                 )
@@ -191,13 +237,17 @@ class VAEMoleculeGenerator:
             # 編碼兩個分子到潛在空間
             # 分子 1
             indices1 = self.tokenizer.encode(smiles1, add_special_tokens=True)
-            tensor1 = torch.tensor([indices1], dtype=torch.long).to(self.device)
+            # tensor1 = torch.tensor([indices1], dtype=torch.long).to(self.device)
+            tensor1 = pad_to_len(indices1, self.max_length, self.tokenizer.pad_idx)
+            tensor1 = torch.tensor([tensor1], dtype=torch.long).to(self.device)
             mu1, logvar1 = self.model.encoder(tensor1)
             z1 = mu1  # 使用均值（不加噪聲）
 
             # 分子 2
             indices2 = self.tokenizer.encode(smiles2, add_special_tokens=True)
-            tensor2 = torch.tensor([indices2], dtype=torch.long).to(self.device)
+            # tensor2 = torch.tensor([indices2], dtype=torch.long).to(self.device)
+            tensor2 = pad_to_len(tensor2, self.max_length, self.tokenizer.pad_idx)
+            tensor2 = torch.tensor([tensor2], dtype=torch.long).to(self.device)
             mu2, logvar2 = self.model.encoder(tensor2)
             z2 = mu2  # 使用均值（不加噪聲）
 
@@ -263,8 +313,14 @@ def test_generator():
     print("開始測試 VAEMoleculeGenerator")
     print("="*80 + "\n")
 
-    # 初始化生成器
+    # 載入 tokenizer
+    tokenizer = SmilesTokenizer()
+    tokenizer.load('./checkpoints/tokenizer.json')
+
+    # 初始化生成器 (從檢查點載入模式)
     generator = VAEMoleculeGenerator(
+        tokenizer=tokenizer,
+        max_length=128,
         config_path='train.yaml',
         tokenizer_path='./checkpoints/tokenizer.json',
         checkpoint_path='./checkpoints/checkpoint_epoch_20.pt'

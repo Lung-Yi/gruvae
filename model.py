@@ -184,6 +184,8 @@ class GRUDecoder(nn.Module):
             # 自回歸生成：一步一步生成
             outputs = []
             input_token = target[:, 0:1]  # [batch_size, 1] - START token
+            # print("input_token")
+            # print(input_token)
 
             for t in range(seq_len):
                 embedded = self.embedding(input_token)  # [batch_size, 1, embedding_dim]
@@ -256,7 +258,7 @@ class GRUVAE(nn.Module):
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """重參數化技巧"""
-        if self.training():
+        if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             z = mu + eps * std
