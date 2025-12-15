@@ -10,6 +10,13 @@ from torch.nn.utils.rnn import pad_sequence
 from typing import List, Tuple, Optional
 from tokenizer import SmilesTokenizer, randomize_smiles, canonicalize_smiles
 
+def pad_to_len(seq, max_len, pad_id):
+    if len(seq) >= max_len:
+        return seq[:max_len]
+    return torch.cat([
+        seq,
+        torch.full((max_len - len(seq),), pad_id, dtype=seq.dtype)
+    ])
 
 class SmilesVAEDataset(Dataset):
     """SMILES VAE Dataset"""
@@ -49,26 +56,26 @@ class SmilesVAEDataset(Dataset):
         canonical_smiles = canonicalize_smiles(smiles)
 
         # 隨機化 SMILES（作為 input）
-        randomized_smiles = randomize_smiles(canonical_smiles)
+        # randomized_smiles = randomize_smiles(canonical_smiles)
 
-        return randomized_smiles, canonical_smiles
+        return canonical_smiles, canonical_smiles
 
 
 def collate_fn(
     batch: List[Tuple[str, str]],
     tokenizer: SmilesTokenizer,
-    max_length: Optional[int] = None
+    max_length: Optional[int] = 50
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Collate function for DataLoader
 
     Args:
-        batch: List of (randomized_smiles, canonical_smiles) tuples
+        batch: List of (canonical_smiles, canonical_smiles) tuples
         tokenizer: SMILES tokenizer
         max_length: 最大序列長度
 
     Returns:
-        encoder_input: [batch_size, seq_len] - 編碼器輸入（randomized + START + END）
+        encoder_input: [batch_size, seq_len] - 編碼器輸入（canonical + START + END）
         decoder_input: [batch_size, seq_len] - 解碼器輸入（canonical + START）
         decoder_target: [batch_size, seq_len] - 解碼器目標（canonical + END）
     """
@@ -88,10 +95,9 @@ def collate_fn(
         decoder_target = canonical_indices + [tokenizer.end_idx]
 
         # 如果設置了最大長度，進行截斷
-        if max_length is not None:
-            encoder_indices = encoder_indices[:max_length]
-            decoder_input = decoder_input[:max_length]
-            decoder_target = decoder_target[:max_length]
+        encoder_indices = pad_to_len(encoder_indices, max_length, tokenizer.pad_idx)
+        decoder_input = pad_to_len(decoder_input, max_length, tokenizer.pad_idx)
+        decoder_target = pad_to_len(decoder_target, max_length, tokenizer.pad_idx)
 
         encoder_inputs.append(torch.tensor(encoder_indices, dtype=torch.long))
         decoder_inputs.append(torch.tensor(decoder_input, dtype=torch.long))
@@ -121,7 +127,7 @@ def get_dataloader(
     csv_file: str,
     tokenizer: SmilesTokenizer,
     batch_size: int = 32,
-    max_length: Optional[int] = None,
+    max_length: Optional[int] = 50,
     shuffle: bool = True,
     num_workers: int = 0
 ) -> DataLoader:
