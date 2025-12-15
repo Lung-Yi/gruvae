@@ -246,7 +246,7 @@ class VAEMoleculeGenerator:
             # 分子 2
             indices2 = self.tokenizer.encode(smiles2, add_special_tokens=True)
             # tensor2 = torch.tensor([indices2], dtype=torch.long).to(self.device)
-            tensor2 = pad_to_len(tensor2, self.max_length, self.tokenizer.pad_idx)
+            tensor2 = pad_to_len(indices2, self.max_length, self.tokenizer.pad_idx)
             tensor2 = torch.tensor([tensor2], dtype=torch.long).to(self.device)
             mu2, logvar2 = self.model.encoder(tensor2)
             z2 = mu2  # 使用均值（不加噪聲）
