@@ -620,7 +620,7 @@ def main(config_path='configs/train.yaml'):
     validation_config = config['validation']
     checkpoint_config = config['checkpoint']
 
-    trainer = Trainer(
+    common_trainer_kwargs = dict(
         model=model,
         tokenizer=tokenizer,
         train_loader=train_loader,
@@ -638,6 +638,68 @@ def main(config_path='configs/train.yaml'):
         num_sample=validation_config['num_sample']
     )
 
+    property_guided_config = config.get('property_guided', {})
+
+    if property_guided_config.get('enabled', False):
+        print("\n啟用 Property-Guided RL 訓練模式")
+        trainer = build_property_guided_trainer(
+            common_trainer_kwargs, property_guided_config, default_max_length=max_length
+        )
+    else:
+        trainer = Trainer(**common_trainer_kwargs)
+
     # 開始訓練
     num_epochs = training_config['num_epochs']
     trainer.train(num_epochs=num_epochs)
+
+
+def build_property_guided_trainer(common_trainer_kwargs: dict, pg_config: dict, default_max_length: int):
+    """依 config 的 `property_guided` 區塊建立 PropertyGuidedTrainer"""
+    from .rl_trainer import PropertyGuidedTrainer
+    from .filters import StructureFilter
+    from .properties import PropertyInferenceAPI
+    from .pareto import PropertySpec
+
+    filter_config = pg_config.get('structure_filter', {})
+    filter_kwargs = {
+        k: v for k, v in dict(
+            max_ring_size=filter_config.get('max_ring_size', 8),
+            max_heavy_atoms=filter_config.get('max_heavy_atoms', 60),
+            min_heavy_atoms=filter_config.get('min_heavy_atoms', 2),
+            forbidden_smarts=filter_config.get('forbidden_smarts'),
+        ).items() if v is not None
+    }
+    filter_api = StructureFilter(**filter_kwargs)
+    inference_api = PropertyInferenceAPI()
+
+    target_spec = {}
+    for prop_name, spec_config in pg_config['target_spec'].items():
+        target_spec[prop_name] = PropertySpec(
+            goal=spec_config['goal'],
+            low=spec_config.get('low'),
+            high=spec_config.get('high'),
+        )
+
+    elite_config = pg_config.get('elite_buffer', {})
+
+    return PropertyGuidedTrainer(
+        **common_trainer_kwargs,
+        filter_api=filter_api,
+        inference_api=inference_api,
+        target_spec=target_spec,
+        max_length=pg_config.get('max_length', default_max_length),
+        num_samples_per_round=pg_config.get('num_samples_per_round', 256),
+        num_rl_rounds_per_epoch=pg_config.get('num_rl_rounds_per_epoch', 1),
+        warmup_epochs=pg_config.get('warmup_epochs', 5),
+        reward_invalid=pg_config.get('reward_invalid', -1.0),
+        reward_structure_fail=pg_config.get('reward_structure_fail', -0.5),
+        reward_pass_base=pg_config.get('reward_pass_base', 0.0),
+        reward_pass_max=pg_config.get('reward_pass_max', 1.0),
+        prior_kl_weight=pg_config.get('prior_kl_weight', 0.1),
+        sampling_temperature=pg_config.get('sampling_temperature', 1.0),
+        elite_buffer_enabled=elite_config.get('enabled', True),
+        elite_buffer_max_size=elite_config.get('max_size', 200),
+        elite_batch_size=elite_config.get('batch_size', 32),
+        elite_train_rounds_per_epoch=elite_config.get('num_train_rounds_per_epoch', 1),
+        front1_log_path=pg_config.get('front1_log_path'),
+    )

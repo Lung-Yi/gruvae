@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from .sampling import sample_next_token
+
 class PositionalEncoding(nn.Module):
     """
     標準 Transformer 位置編碼
@@ -128,14 +130,40 @@ class TransformerVAE(nn.Module):
         logvar = self.fc_logvar(memory_pooled)
         z = self.reparameterize(mu, logvar)
 
-        # 3. Decode
+        # 3. Decode（跳過 encoder，直接給定 z 解碼，抽成獨立方法方便重用）
+        logits = self.decode_with_z(
+            z, tgt,
+            teacher_forcing=teacher_forcing,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask
+        )
+
+        return logits, mu, logvar
+
+    def decode_with_z(
+        self,
+        z: torch.Tensor,
+        decoder_input: torch.Tensor,
+        teacher_forcing: bool = True,
+        tgt_mask=None,
+        tgt_key_padding_mask=None
+    ) -> torch.Tensor:
+        """
+        給定潛在向量 z 直接解碼（跳過 encoder）。
+        用於 RL 微調時重複使用同一個採樣用的 z 來重新計算 log-prob。
+
+        Args:
+            z: [Batch, latent_dim]
+            decoder_input: [Batch, Seq_Len] - teacher forcing 時的輸入序列
+        """
+        seq_len = decoder_input.size(1)
+
         # 將 z 映射回 d_model 並作為 Decoder 的 "Memory" (Context)
-        # Reshape to [Batch, 1, d_model] so decoder can attend to it
         z_memory = self.latent_to_hidden(z).unsqueeze(1)
 
         if teacher_forcing:
             # Teacher forcing: 使用真實的目標序列作為輸入
-            tgt_emb = self.embedding(tgt) * math.sqrt(self.d_model)
+            tgt_emb = self.embedding(decoder_input) * math.sqrt(self.d_model)
             tgt_emb = self.pos_encoder(tgt_emb)
 
             # Transformer Decoder
@@ -152,7 +180,7 @@ class TransformerVAE(nn.Module):
             # 自回歸生成：一步一步生成
             # 從 START token 開始
             outputs = []
-            input_token = tgt[:, 0:1]  # [Batch, 1] - START token
+            input_token = decoder_input[:, 0:1]  # [Batch, 1] - START token
 
             for t in range(seq_len):
                 # Embedding
@@ -161,7 +189,7 @@ class TransformerVAE(nn.Module):
 
                 # 生成 causal mask (只看到當前和之前的位置)
                 current_len = t + 1
-                mask = self.generate_square_subsequent_mask(current_len).to(src.device)
+                mask = self.generate_square_subsequent_mask(current_len).to(decoder_input.device)
 
                 # Decoder
                 output = self.transformer_decoder(
@@ -180,7 +208,7 @@ class TransformerVAE(nn.Module):
 
             logits = torch.cat(outputs, dim=1)  # [Batch, Seq_Len, vocab_size]
 
-        return logits, mu, logvar
+        return logits
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -245,6 +273,55 @@ class TransformerVAE(nn.Module):
             samples = torch.cat(outputs, dim=1)  # [num_samples, max_length]
 
         return samples
+
+    def sample_stochastic(
+        self,
+        num_samples: int,
+        max_length: int,
+        start_idx: int,
+        device: torch.device,
+        sampling_mode: str = 'multinomial',
+        temperature: float = 1.0
+    ):
+        """
+        從潛在空間採樣生成新分子，並回傳採樣用的 z。
+        跟 sample() 的差別是這裡預設用 multinomial 隨機採樣（而非 greedy），
+        且回傳 z 讓呼叫端可以之後用同一個 z 重新做 teacher forcing（例如 RL 微調時計算 log-prob）。
+
+        Returns:
+            tokens: [num_samples, max_length]
+            z: [num_samples, latent_dim]
+        """
+        self.eval()
+        with torch.no_grad():
+            z = torch.randn(num_samples, self.latent_dim).to(device)
+            z_memory = self.latent_to_hidden(z).unsqueeze(1)  # [num_samples, 1, d_model]
+
+            input_token = torch.full((num_samples, 1), start_idx, dtype=torch.long).to(device)
+            tokens = []
+
+            for t in range(max_length):
+                tgt_emb = self.embedding(input_token) * math.sqrt(self.d_model)
+                tgt_emb = self.pos_encoder(tgt_emb)
+
+                current_len = t + 1
+                mask = self.generate_square_subsequent_mask(current_len).to(device)
+
+                output = self.transformer_decoder(
+                    tgt=tgt_emb,
+                    memory=z_memory,
+                    tgt_mask=mask
+                )
+
+                step_logits = self.fc_out(output[:, -1:, :])  # [num_samples, 1, vocab_size]
+                next_token = sample_next_token(step_logits, sampling_mode=sampling_mode, temperature=temperature)
+
+                tokens.append(next_token)
+                input_token = torch.cat([input_token, next_token], dim=1)
+
+            samples = torch.cat(tokens, dim=1)  # [num_samples, max_length]
+
+        return samples, z
 
 
 if __name__ == "__main__":
