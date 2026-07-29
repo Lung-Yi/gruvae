@@ -1,12 +1,15 @@
 # Property-Guided RL 訓練配置檔案
 # 用法: python train.py --config configs/train_property_guided.yaml
 #
-# 除了原本的監督式 VAE 訓練，warmup 結束後每個 epoch 會額外：
-#   1. 用目前的模型採樣一批分子，依「結構規則(filter_api)」+「性質目標(target_spec) 的
-#      pareto front 排序」算 reward，做 REINFORCE 微調
-#   2. 把這一輪 front 1（最好的一層）且結構合規的分子累積進 elite buffer，
-#      持續用這些分子做監督式訓練，讓它們一直留在訓練資料中
-#   3. 把每一輪 front 1 的分子結構與性質寫進 property_guided.front1_log_path
+# 開啟 property_guided.enabled 後：
+#   1. 訓練資料在一開始就會先用 filter_api 過濾過，只保留符合結構規則的 SMILES
+#      （filter_api 判不合規的分子完全不會出現在訓練資料裡）
+#   2. warmup 結束後每個 epoch 會額外用目前的模型採樣一批分子，依「結構規則(filter_api)」
+#      +「性質目標(target_spec) 的 pareto front 排序」算 reward，做 REINFORCE 微調
+#   3. 通過結構規則的分子會被拿去更新一個動態訓練池：新分子併入、池子滿了就對整個池子
+#      重新做 pareto front 排序、淘汰最差的一批，這個池子會直接同步進實際的訓練資料，
+#      讓「一直勝出的分子」真的持續留在訓練資料中，被比下去的分子則會被移除
+#   4. 每一輪 front 1（最好的一層）的分子結構與性質會寫進 property_guided.front1_log_path，
 #      可以訓練過程中打開該 CSV 檔監看進度
 
 # 資料設定
@@ -47,8 +50,11 @@ validation:
 
 # 檢查點設定
 checkpoint:
-  save_dir: './checkpoints/property_guided'
+  save_dir: './checkpoints/property_guided_2'
   save_interval: 5
+  load_from: './checkpoints/property_guided/best_model.pt'      # 設定 .pt 檔案路徑會先載入該模型權重（例如載入已訓練好的 configs/train.yaml
+                        # 產出的模型，從那裡開始做 property-guided 微調），會自動嘗試載入同目錄下
+                        # 的 tokenizer.json 確保詞彙表一致
 
 # 設備設定
 device:
@@ -68,15 +74,15 @@ property_guided:
 
   # 每個 RL round 取樣幾個分子 / 每個 epoch 跑幾個 RL round
   num_samples_per_round: 2048
-  num_rl_rounds_per_epoch: 1
+  num_rl_rounds_per_epoch: 2
 
   # 前幾個 epoch 只做原本的監督式訓練，讓模型先學會基本合法的 SMILES 語法，
   # 之後才開始 RL 微調（太早開始 pareto 篩選/自我訓練意義不大甚至有害）
-  warmup_epochs: 10
+  warmup_epochs: 0
 
   # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
-  reward_invalid: -1.0
-  reward_structure_fail: -0.5
+  reward_invalid: -2.0
+  reward_structure_fail: -1
   reward_pass_base: 0.0
   reward_pass_max: 1.0
 
@@ -91,25 +97,27 @@ property_guided:
     max_ring_size: 8
     max_heavy_atoms: 60
     min_heavy_atoms: 2
-    # forbidden_smarts:            # 不填則用內建的預設示範規則
+    # forbidden_smarts:            # 黑名單，符合其中任何一個就濾掉；不填則用內建的預設示範規則
     #   - "[N;R0]=[N;R0]=[N;R0]"
+    desired_smarts:               # 白名單/必要結構，分子要符合這裡的規則才會通過；不填則不限制
+      - "[#7]1~[#7]~[#6]~[#6]~[#6]1"                # 例如要求一定要含有苯環
+    # require_all_desired: true     # desired_smarts 要全部都符合(true) 還是符合一個就好(false)
 
   # 分子性質目標 (target_spec)：每個性質可以是
   #   goal: maximize | minimize | range (range 需要同時給 low / high)
   target_spec:
     ClogP:
       goal: range
-      low: 1.0
-      high: 3.0
+      low: 5.0
+      high: 6.5
     SAScore:
       goal: minimize
 
-  # Elite buffer：累積「一直合規且 front 1」的分子，持續用它們做監督式訓練
-  elite_buffer:
+  # 動態訓練資料：把「持續勝出」的合規分子直接同步進實際的訓練資料集
+  # （新分子併入、池子滿了就整池重新 pareto 排序、淘汰最差的一批）
+  dynamic_training_data:
     enabled: true
-    max_size: 200
-    batch_size: 32
-    num_train_rounds_per_epoch: 1
+    max_pool_size: 5000
 
   # Front 1 分子的 CSV log 路徑，不填則預設存在 checkpoint.save_dir 底下的 front1_log.csv
   front1_log_path: null

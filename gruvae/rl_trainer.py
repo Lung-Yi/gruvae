@@ -8,11 +8,17 @@ PropertyGuidedTrainer：在標準 VAE 監督式訓練之外，額外用 REINFORC
     3. 對合規的分子用 inference_api 計算性質，依照 target_spec 做 pareto front 排序
     4. 依「是否合規」+「pareto front 名次」組成單一 reward，用 REINFORCE + baseline
        做 policy gradient 更新，並用一份凍結的 prior 模型做正則化，避免生成多樣性崩潰
-    5. 這一輪排在 front 1（最好的一層）且通過結構檢查的分子，會被加進一個持續累積的
-       「elite buffer」；每個 epoch 額外用 elite buffer 裡的分子做一次標準 VAE 監督式
-       訓練（reconstruction + KL），讓這些一直表現很好的分子持續留在訓練資料中
-    6. 每一輪的 front 1 分子結構與性質會被印出來，並且累積寫進一個 CSV log，方便訓練
-       過程中監看
+    5. 通過結構檢查的分子會被拿去更新一個持續累積的「動態訓練池 (dynamic pool)」：
+       新分子併入池子，池子滿了就對整個池子重新做 pareto front 排序，淘汰最差的一批，
+       讓池子始終保留「目前為止看過最好的一批分子」。這個池子會被直接同步進
+       train_loader 的 Dataset，變成「真的存在於訓練資料中」，下個 epoch 的監督式訓練
+       就會用到它們。
+    6. 每一輪 pareto front 1（最好的一層）分子的結構與性質會被印出來，並累積寫進 CSV
+       log，方便訓練過程中監看
+
+注意：這個 Trainer 假設 train_loader.dataset 是 `gruvae.dataset.DynamicSmilesDataset`
+（或任何有 `set_dynamic_smiles(smiles_list)` 方法的 Dataset），這樣「動態訓練池」才能
+真的反映到下一輪的監督式訓練上；如果不是，動態訓練池機制會自動停用並印出警告。
 """
 
 import copy
@@ -26,8 +32,6 @@ import torch.nn.functional as F
 
 from .training import Trainer
 from .tokenizer import canonicalize_smiles
-from .dataset import collate_fn
-from .models import compute_loss
 from .pareto import PropertySpec, assign_pareto_fronts
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -36,8 +40,8 @@ RDLogger.DisableLog('rdApp.*')
 class PropertyGuidedTrainer(Trainer):
     """
     繼承自 Trainer，複用 train_epoch / validate / save_checkpoint，
-    只在 train() 的 epoch 迴圈中額外插入 property-guided 的 RL 微調回合
-    以及 elite buffer 的監督式訓練回合。
+    只在 train() 的 epoch 迴圈中額外插入 property-guided 的 RL 微調回合，
+    並維護一個會同步進訓練資料的動態分子池。
     """
 
     def __init__(
@@ -56,10 +60,8 @@ class PropertyGuidedTrainer(Trainer):
         reward_pass_max: float = 1.0,
         prior_kl_weight: float = 0.1,
         sampling_temperature: float = 1.0,
-        elite_buffer_enabled: bool = True,
-        elite_buffer_max_size: int = 200,
-        elite_batch_size: int = 32,
-        elite_train_rounds_per_epoch: int = 1,
+        dynamic_pool_enabled: bool = True,
+        dynamic_pool_max_size: int = 500,
         front1_log_path: Optional[str] = None,
         **kwargs
     ):
@@ -81,10 +83,8 @@ class PropertyGuidedTrainer(Trainer):
             reward_pass_max: 合規且 pareto front 最好 (front 1 / rank 0) 時的 reward
             prior_kl_weight: prior regularization 的權重（防止 RL 微調時 mode collapse）
             sampling_temperature: multinomial 採樣的溫度
-            elite_buffer_enabled: 是否累積「一直合規且 front 1」的分子，持續加進訓練資料
-            elite_buffer_max_size: elite buffer 最多保留幾個分子
-            elite_batch_size: 用 elite buffer 訓練時的 batch size
-            elite_train_rounds_per_epoch: 每個 epoch 用 elite buffer 訓練幾輪
+            dynamic_pool_enabled: 是否把合規分子動態加入/淘汰進訓練資料
+            dynamic_pool_max_size: 動態訓練池最多保留幾個分子（用全池 pareto front 排序淘汰）
             front1_log_path: front 1 分子的 CSV log 路徑，預設存在 save_dir 底下
         """
         super().__init__(*args, **kwargs)
@@ -103,12 +103,17 @@ class PropertyGuidedTrainer(Trainer):
         self.prior_kl_weight = prior_kl_weight
         self.sampling_temperature = sampling_temperature
 
-        self.elite_buffer_enabled = elite_buffer_enabled
-        self.elite_buffer_max_size = elite_buffer_max_size
-        self.elite_batch_size = elite_batch_size
-        self.elite_train_rounds_per_epoch = elite_train_rounds_per_epoch
-        # canonical_smiles -> {smiles, properties, first_epoch, last_epoch, times_seen}
-        self.elite_buffer: Dict[str, dict] = {}
+        self.dynamic_pool_enabled = dynamic_pool_enabled
+        self.dynamic_pool_max_size = dynamic_pool_max_size
+        # canonical_smiles -> {'smiles': str, 'objective': np.ndarray}
+        self.dynamic_pool: Dict[str, dict] = {}
+
+        if self.dynamic_pool_enabled and not hasattr(self.train_loader.dataset, 'set_dynamic_smiles'):
+            print(
+                "⚠ train_loader.dataset 不支援 set_dynamic_smiles()，"
+                "dynamic_pool 機制已自動停用（請改用 gruvae.dataset.DynamicSmilesDataset）"
+            )
+            self.dynamic_pool_enabled = False
 
         self.front1_log_path = front1_log_path or os.path.join(self.save_dir, 'front1_log.csv')
 
@@ -166,8 +171,10 @@ class PropertyGuidedTrainer(Trainer):
         Returns:
             rewards: np.ndarray [N]
             pass_smiles_ordered: 通過結構檢查的 SMILES（用於算性質的順序）
-            prop_df: 只對 pass_smiles_ordered 算出的性質 DataFrame（沒有通過結構檢查則為 None）
-            front_ranks: 對應 pass_smiles_ordered 的 pareto front rank（0 = 最好，None 表示沒有）
+            objective_matrix: 對應 pass_smiles_ordered 的目標值矩陣（越小越好，跨 round 可比較），
+                沒有通過結構檢查的分子則為 None
+            prop_df: 只對 pass_smiles_ordered 算出的性質 DataFrame（沒有則為 None）
+            front_ranks: 對應 pass_smiles_ordered 的 pareto front rank（0 = 最好，沒有則為 None）
         """
         rewards = np.full(len(smiles_list), self.reward_invalid, dtype=np.float64)
 
@@ -176,7 +183,7 @@ class PropertyGuidedTrainer(Trainer):
         valid_smiles = [smiles_list[i] for i in valid_indices]
 
         if not valid_smiles:
-            return rewards, [], None, None
+            return rewards, [], None, None, None
 
         pass_set = set(self.filter_api(valid_smiles))
 
@@ -190,7 +197,7 @@ class PropertyGuidedTrainer(Trainer):
                 rewards[i] = self.reward_structure_fail
 
         if not pass_smiles_ordered:
-            return rewards, [], None, None
+            return rewards, [], None, None, None
 
         property_names = list(self.target_spec.keys())
         prop_df = self.inference_api.inference_pipeline(pass_smiles_ordered, properties=property_names)
@@ -207,16 +214,16 @@ class PropertyGuidedTrainer(Trainer):
             scale = 1.0 - (front_ranks[local_idx] / max_front) if max_front > 0 else 1.0
             rewards[global_idx] = self.reward_pass_base + (self.reward_pass_max - self.reward_pass_base) * scale
 
-        return rewards, pass_smiles_ordered, prop_df, front_ranks
+        return rewards, pass_smiles_ordered, objective_matrix, prop_df, front_ranks
 
     # ------------------------------------------------------------------
-    # Elite buffer：累積「一直合規且 front 1」的分子，讓它們持續留在訓練資料中
+    # Front 1 監看用的 log
     # ------------------------------------------------------------------
-    def _update_elite_buffer_and_log(
+    def _log_front1_molecules(
         self, epoch: int, round_idx: int,
         pass_smiles_ordered: List[str], prop_df, front_ranks
     ) -> List[dict]:
-        """把這一輪 front 1（front_rank == 0）的分子記錄下來，並視需要加進 elite buffer"""
+        """挑出這一輪 front 1（front_rank == 0）的分子，印出來並累積寫進 CSV"""
         if prop_df is None or front_ranks is None:
             return []
 
@@ -226,123 +233,54 @@ class PropertyGuidedTrainer(Trainer):
         for local_idx, smiles in enumerate(pass_smiles_ordered):
             if front_ranks[local_idx] != 0:
                 continue
+            properties = {name: prop_df.iloc[local_idx][name] for name in property_names}
+            front1_rows.append({'smiles': smiles, 'properties': properties})
 
+        if front1_rows:
+            write_header = not os.path.exists(self.front1_log_path)
+            with open(self.front1_log_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(['epoch', 'round', 'smiles'] + property_names)
+                for row in front1_rows:
+                    writer.writerow(
+                        [epoch, round_idx, row['smiles']] +
+                        [row['properties'].get(name, '') for name in property_names]
+                    )
+
+        return front1_rows
+
+    # ------------------------------------------------------------------
+    # 動態訓練池：新分子併入 -> 全池重新 pareto 排序 -> 淘汰最差的一批 -> 同步進訓練資料
+    # ------------------------------------------------------------------
+    def _update_dynamic_pool(self, pass_smiles_ordered: List[str], objective_matrix: Optional[np.ndarray]):
+        if not self.dynamic_pool_enabled or objective_matrix is None or not pass_smiles_ordered:
+            return
+
+        for smiles, obj_vec in zip(pass_smiles_ordered, objective_matrix):
             canonical = canonicalize_smiles(smiles)
             if not canonical:
                 continue
+            # 同一個分子重複出現時，只保留目標值比較好的那次紀錄
+            existing = self.dynamic_pool.get(canonical)
+            if existing is None or np.all(obj_vec <= existing['objective']):
+                self.dynamic_pool[canonical] = {'smiles': smiles, 'objective': obj_vec}
 
-            properties = {name: prop_df.iloc[local_idx][name] for name in property_names}
-            front1_rows.append({'smiles': smiles, 'canonical': canonical, 'properties': properties})
+        if len(self.dynamic_pool) > self.dynamic_pool_max_size:
+            keys = list(self.dynamic_pool.keys())
+            objective_stack = np.stack([self.dynamic_pool[k]['objective'] for k in keys])
+            ranks = assign_pareto_fronts(objective_stack)
+            # 依 front rank 排序，只保留最好的 dynamic_pool_max_size 個（同一 front 內不細分優劣）
+            order = np.argsort(ranks, kind='stable')
+            keep_keys = {keys[i] for i in order[:self.dynamic_pool_max_size]}
+            self.dynamic_pool = {k: v for k, v in self.dynamic_pool.items() if k in keep_keys}
 
-            if self.elite_buffer_enabled:
-                if canonical in self.elite_buffer:
-                    self.elite_buffer[canonical]['times_seen'] += 1
-                    self.elite_buffer[canonical]['last_epoch'] = epoch
-                else:
-                    self.elite_buffer[canonical] = {
-                        'smiles': smiles,
-                        'properties': properties,
-                        'first_epoch': epoch,
-                        'last_epoch': epoch,
-                        'times_seen': 1,
-                    }
-
-        if self.elite_buffer_enabled and len(self.elite_buffer) > self.elite_buffer_max_size:
-            # 超過容量時，優先淘汰最久沒再被抽到、且被抽到次數少的分子
-            sorted_keys = sorted(
-                self.elite_buffer.keys(),
-                key=lambda k: (self.elite_buffer[k]['last_epoch'], self.elite_buffer[k]['times_seen'])
-            )
-            num_to_remove = len(self.elite_buffer) - self.elite_buffer_max_size
-            for key in sorted_keys[:num_to_remove]:
-                del self.elite_buffer[key]
-
-        self._log_front1(epoch, round_idx, front1_rows, property_names)
-        return front1_rows
-
-    def _log_front1(self, epoch: int, round_idx: int, front1_rows: List[dict], property_names: List[str]):
-        """把 front 1 分子的結構與性質累積寫進 CSV，方便訓練過程中監看"""
-        if not front1_rows:
-            return
-
-        write_header = not os.path.exists(self.front1_log_path)
-        with open(self.front1_log_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(['epoch', 'round', 'smiles'] + property_names)
-            for row in front1_rows:
-                writer.writerow(
-                    [epoch, round_idx, row['smiles']] +
-                    [row['properties'].get(name, '') for name in property_names]
-                )
-
-    def _train_on_elite_buffer(self, epoch: int) -> Optional[dict]:
-        """用 elite buffer 裡累積的分子做一次標準 VAE 監督式訓練（reconstruction + KL）"""
-        if not self.elite_buffer_enabled or not self.elite_buffer:
-            return None
-
-        elite_smiles = [entry['smiles'] for entry in self.elite_buffer.values()]
-
-        # BatchNorm 在 train() 模式下要求每個 batch 至少有 2 筆資料，把會產生單筆 batch 的
-        # 情況（例如 elite buffer 剛好剩 1 個分子，或最後一個 batch 只分到 1 筆）濾掉
-        batches = [
-            elite_smiles[start:start + self.elite_batch_size]
-            for start in range(0, len(elite_smiles), self.elite_batch_size)
-        ]
-        batches = [b for b in batches if len(b) >= 2]
-        if not batches:
-            return None
-
-        self.model.train()
-        total_loss, total_recon, total_kl, num_batches = 0.0, 0.0, 0.0, 0
-
-        for batch_smiles in batches:
-            batch_pairs = [(s, s) for s in batch_smiles]
-            encoder_input, decoder_input, decoder_target = collate_fn(
-                batch_pairs, self.tokenizer, max_length=self.max_length
-            )
-            encoder_input = encoder_input.to(self.device)
-            decoder_input = decoder_input.to(self.device)
-            decoder_target = decoder_target.to(self.device)
-
-            if self.model_type == 'transformer':
-                src_key_padding_mask, tgt_key_padding_mask, tgt_mask = self.create_masks(
-                    encoder_input, decoder_input
-                )
-                output, mu, logvar = self.model(
-                    encoder_input, decoder_input,
-                    src_key_padding_mask=src_key_padding_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    tgt_mask=tgt_mask,
-                    teacher_forcing=True
-                )
-            else:
-                output, mu, logvar = self.model(encoder_input, decoder_input, teacher_forcing=True)
-
-            loss, recon_loss, kl_loss = compute_loss(
-                output, decoder_target, mu, logvar,
-                pad_idx=self.tokenizer.pad_idx, kl_weight=self.current_kl_weight
-            )
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_max_norm)
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            total_recon += recon_loss.item()
-            total_kl += kl_loss.item()
-            num_batches += 1
-
-        return {
-            'elite_buffer_size': len(elite_smiles),
-            'loss': total_loss / num_batches,
-            'recon': total_recon / num_batches,
-            'kl': total_kl / num_batches,
-        }
+        self.train_loader.dataset.set_dynamic_smiles(
+            [entry['smiles'] for entry in self.dynamic_pool.values()]
+        )
 
     # ------------------------------------------------------------------
-    # 一個 RL round：採樣 -> 評分 -> policy gradient 更新 -> 更新 elite buffer
+    # 一個 RL round：採樣 -> 評分 -> policy gradient 更新 -> 更新動態訓練池
     # ------------------------------------------------------------------
     def run_rl_round(self, epoch: int, round_idx: int) -> Tuple[dict, List[str]]:
         tokens, z = self.model.sample_stochastic(
@@ -359,8 +297,9 @@ class PropertyGuidedTrainer(Trainer):
             for i in range(tokens.size(0))
         ]
 
-        rewards, pass_smiles_ordered, prop_df, front_ranks = self._score_batch(smiles_list)
-        front1_rows = self._update_elite_buffer_and_log(epoch, round_idx, pass_smiles_ordered, prop_df, front_ranks)
+        rewards, pass_smiles_ordered, objective_matrix, prop_df, front_ranks = self._score_batch(smiles_list)
+        front1_rows = self._log_front1_molecules(epoch, round_idx, pass_smiles_ordered, prop_df, front_ranks)
+        self._update_dynamic_pool(pass_smiles_ordered, objective_matrix)
 
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         advantage = (rewards_t - rewards_t.mean()).detach()
@@ -394,7 +333,7 @@ class PropertyGuidedTrainer(Trainer):
             'num_valid': num_valid,
             'num_pass_filter': num_pass,
             'num_front1': len(front1_rows),
-            'elite_buffer_size': len(self.elite_buffer),
+            'dynamic_pool_size': len(self.dynamic_pool),
             'mean_reward': float(rewards_t.mean().item()),
             'loss_pg': float(loss_pg.item()),
             'loss_prior': float(loss_prior.item()),
@@ -407,9 +346,9 @@ class PropertyGuidedTrainer(Trainer):
     # 整體訓練迴圈
     # ------------------------------------------------------------------
     def train(self, num_epochs: int):
-        """訓練模型：每個 epoch 先做原本的監督式訓練，warmup 結束後再做 RL 微調 + elite buffer 訓練"""
+        """訓練模型：每個 epoch 先做原本的監督式訓練，warmup 結束後再做 RL 微調"""
         print(f"開始訓練 {num_epochs} epochs（property-guided RL，warmup={self.warmup_epochs} epochs）...")
-        print(f"訓練集大小: {len(self.train_loader.dataset)}")
+        print(f"訓練集大小: {len(self.train_loader.dataset)}（含動態訓練池: {self.dynamic_pool_enabled}）")
         print(f"驗證集大小: {len(self.val_loader.dataset)}")
         print(f"設備: {self.device}")
         print(f"Front 1 log: {self.front1_log_path}\n")
@@ -437,6 +376,7 @@ class PropertyGuidedTrainer(Trainer):
             print(f"\n{'='*80}")
             print(f"Epoch {epoch} Summary:")
             print(f"{'='*80}")
+            print(f"  訓練資料筆數（含動態池）: {len(self.train_loader.dataset)}")
             print(f"  Train - Loss: {train_metrics['loss']:.4f}, Recon: {train_metrics['recon']:.4f}, KL: {train_metrics['kl']:.4f}")
             print(f"  Val   - Loss: {val_metrics['loss']:.4f}, Recon: {val_metrics['recon']:.4f}, KL: {val_metrics['kl']:.4f}")
             print(f"  Val Recon Acc: {val_metrics['recon_acc']:.2%}")
@@ -453,7 +393,7 @@ class PropertyGuidedTrainer(Trainer):
                         f"  [RL round {round_idx + 1}/{self.num_rl_rounds_per_epoch}] "
                         f"sampled={rl_metrics['num_sampled']} valid={rl_metrics['num_valid']} "
                         f"pass_filter={rl_metrics['num_pass_filter']} front1={rl_metrics['num_front1']} "
-                        f"elite_buffer={rl_metrics['elite_buffer_size']} "
+                        f"dynamic_pool={rl_metrics['dynamic_pool_size']} "
                         f"mean_reward={rl_metrics['mean_reward']:.4f} "
                         f"loss_pg={rl_metrics['loss_pg']:.4f} loss_prior={rl_metrics['loss_prior']:.4f}"
                     )
@@ -464,15 +404,6 @@ class PropertyGuidedTrainer(Trainer):
                             print(f"      {row['smiles']}  ({props_str})")
                     else:
                         print(f"    範例生成分子: {sample_smiles[:5]}")
-
-                for _ in range(self.elite_train_rounds_per_epoch):
-                    elite_metrics = self._train_on_elite_buffer(epoch)
-                    if elite_metrics:
-                        print(
-                            f"  [Elite buffer] size={elite_metrics['elite_buffer_size']} "
-                            f"loss={elite_metrics['loss']:.4f} recon={elite_metrics['recon']:.4f} "
-                            f"kl={elite_metrics['kl']:.4f}"
-                        )
 
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
@@ -486,11 +417,13 @@ class PropertyGuidedTrainer(Trainer):
 
 
 if __name__ == "__main__":
-    # 簡單的煙霧測試：用隨機資料跑一個 epoch，確認整條流程（含 elite buffer / front1 log）可以跑通
+    # 簡單的煙霧測試：用隨機資料跑幾個 epoch，確認整條流程
+    # （含「訓練資料只含合規 SMILES」+「動態訓練池新增/淘汰」+ front1 log）可以跑通
     import torch as _torch
     from torch.utils.data import DataLoader
 
     from .tokenizer import SmilesTokenizer
+    from .dataset import DynamicSmilesDataset, collate_fn
     from .models import GRUVAE
     from .filters import StructureFilter
     from .properties import PropertyInferenceAPI
@@ -501,22 +434,17 @@ if __name__ == "__main__":
     tokenizer.build_vocab(smiles_samples)
 
     max_length = 20
+    filter_api = StructureFilter()
 
-    class _ListDataset(_torch.utils.data.Dataset):
-        def __init__(self, items):
-            self.items = items
+    # 訓練資料一開始就先過濾掉不符合結構規則的 SMILES
+    base_smiles = filter_api(smiles_samples)
+    print(f"訓練資料過濾: {len(smiles_samples)} -> {len(base_smiles)}（只保留合規的 SMILES）")
 
-        def __len__(self):
-            return len(self.items)
-
-        def __getitem__(self, idx):
-            s = self.items[idx]
-            return s, s
-
-    dataset = _ListDataset(smiles_samples)
+    dataset = DynamicSmilesDataset(base_smiles)
     loader = DataLoader(
         dataset, batch_size=8, shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length)
+        collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length),
+        drop_last=True
     )
 
     model = GRUVAE(
@@ -537,15 +465,19 @@ if __name__ == "__main__":
         device=_torch.device('cpu'),
         model_type='gru',
         save_dir='/tmp/gruvae_rl_smoke_test',
-        filter_api=StructureFilter(),
+        filter_api=filter_api,
         inference_api=PropertyInferenceAPI(),
         target_spec=target_spec,
         max_length=max_length,
         num_samples_per_round=32,
         num_rl_rounds_per_epoch=1,
         warmup_epochs=0,
-        elite_buffer_max_size=10,
+        dynamic_pool_max_size=10,
     )
 
     trainer.train(num_epochs=2)
-    print(f"✓ PropertyGuidedTrainer 煙霧測試通過，elite buffer 累積了 {len(trainer.elite_buffer)} 個分子")
+    print(
+        f"✓ PropertyGuidedTrainer 煙霧測試通過，"
+        f"動態訓練池累積了 {len(trainer.dynamic_pool)} 個分子，"
+        f"目前訓練資料筆數: {len(trainer.train_loader.dataset)}"
+    )
