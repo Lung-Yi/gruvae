@@ -83,8 +83,8 @@ property_guided:
   # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
   reward_invalid: -2.0
   reward_structure_fail: -1
-  reward_pass_base: 0.0
-  reward_pass_max: 1.0
+  reward_pass_base: 1.0
+  reward_pass_max: 2.0
 
   # Prior regularization 權重，防止 RL 微調時生成多樣性崩潰 (mode collapse)
   prior_kl_weight: 0.1
