@@ -102,7 +102,7 @@ def process_smiles_file(input_file, output_file, max_heavy_atoms=20):
 
 
 if __name__ == "__main__":
-    input_file = "./data/train.txt"
-    output_file = "./data/train_processed.csv"
+    input_file = "./data/raw/train.txt"
+    output_file = "./data/processed/train_processed.csv"
 
     process_smiles_file(input_file, output_file, max_heavy_atoms=20)

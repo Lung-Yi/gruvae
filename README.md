@@ -21,21 +21,36 @@
 
 ```
 gruvae/
-├── README.md                   # 專案說明文檔
-├── CONFIG_GUIDE.md             # 配置檔案使用指南
-├── UPDATES.md                  # 更新記錄
-├── train.yaml                  # 訓練配置檔案
-├── tokenizer.py                # SMILES 分詞器
-├── dataset.py                  # Dataset 和 DataLoader
-├── model.py                    # GRU-VAE 模型架構
-├── train.py                    # 訓練腳本
-├── process_smiles.py           # 資料預處理腳本
+├── README.md                    # 專案說明文檔
+├── CHANGELOG.md                 # 變更日誌
+├── train.py                     # 訓練入口點 (python train.py --config configs/train.yaml)
+├── run_task.sh                  # 背景執行訓練用的腳本
+├── docs/
+│   ├── CONFIG_GUIDE.md          # 配置檔案使用指南
+│   ├── GENERATOR_GUIDE.md       # 分子生成器使用指南
+│   └── UPDATES.md               # 更新記錄
+├── configs/
+│   └── train.yaml               # 訓練配置檔案
+├── gruvae/                      # 核心套件
+│   ├── tokenizer.py             # SMILES 分詞器
+│   ├── dataset.py               # Dataset 和 DataLoader
+│   ├── preprocess.py            # 資料預處理腳本
+│   ├── generation.py            # VAEMoleculeGenerator（推理/採樣/插值）
+│   ├── training.py              # Trainer 與訓練流程
+│   └── models/
+│       ├── gru_vae.py           # GRU-VAE 模型架構
+│       └── transformer_vae.py   # Transformer-VAE 模型架構
 ├── data/
-│   ├── train.txt               # 原始訓練資料
-│   └── train_processed.csv     # 處理後的資料
-└── checkpoints/
-    ├── tokenizer.json          # 保存的 tokenizer
-    └── best_model.pt           # 最佳模型檢查點
+│   ├── raw/train.txt            # 原始訓練資料
+│   └── processed/*.csv          # 處理後的資料
+├── checkpoints/                 # 各實驗的模型檢查點（不進版控，*.pt 已被 .gitignore 排除）
+│   ├── gru/                     # 對應 train.yaml 預設實驗
+│   ├── small/                   # 小規模資料集實驗
+│   ├── test/                    # 測試用實驗
+│   └── gru_legacy/              # 舊版 GRU 實驗保留
+└── outputs/
+    ├── logs/                    # 訓練 log
+    └── result_gru.txt           # 訓練結果紀錄
 ```
 
 ## 環境需求
@@ -77,16 +92,18 @@ conda install pytorch rdkit pandas numpy tqdm -c pytorch -c conda-forge
 將原始 SMILES 資料處理為訓練格式：
 
 ```bash
-python process_smiles.py
+python -m gruvae.preprocess
 ```
 
 這個腳本會：
-- 讀取 `./data/train.txt` 中的 SMILES
+- 讀取 `./data/raw/train.txt` 中的 SMILES
 - 移除手性和順反異構信息
 - 過濾掉重原子數 > 20 的分子
-- 輸出到 `./data/train_processed.csv`
+- 輸出到 `./data/processed/train_processed.csv`
 
 ### 2. 訓練模型
+
+`train.py` 是唯一的訓練入口點。
 
 #### 使用預設配置訓練
 
@@ -97,7 +114,7 @@ python train.py
 #### 使用自訂配置訓練
 
 ```bash
-python train.py --config my_config.yaml
+python train.py --config configs/my_config.yaml
 ```
 
 訓練過程中會：
@@ -105,9 +122,9 @@ python train.py --config my_config.yaml
 - 自動建立並保存 tokenizer
 - 每個 epoch 結束後進行驗證
 - 顯示分子重建結果和採樣結果
-- 自動保存最佳模型到配置指定的目錄
+- 自動保存最佳模型到配置指定的 `checkpoint.save_dir` 目錄
 
-詳細的配置說明請參考 [CONFIG_GUIDE.md](CONFIG_GUIDE.md)
+詳細的配置說明請參考 [docs/CONFIG_GUIDE.md](docs/CONFIG_GUIDE.md)
 
 ### 3. 監控訓練
 
@@ -200,12 +217,12 @@ max_length = 100             # 最大序列長度
 
 ```python
 import torch
-from model import GRUVAE
-from tokenizer import SmilesTokenizer
+from gruvae.models import GRUVAE
+from gruvae.tokenizer import SmilesTokenizer
 
 # 載入 tokenizer
 tokenizer = SmilesTokenizer()
-tokenizer.load('./checkpoints/tokenizer.json')
+tokenizer.load('./checkpoints/gru/tokenizer.json')
 
 # 建立模型
 model = GRUVAE(
@@ -217,7 +234,7 @@ model = GRUVAE(
 )
 
 # 載入權重
-checkpoint = torch.load('./checkpoints/best_model.pt')
+checkpoint = torch.load('./checkpoints/gru/best_model.pt')
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 ```
@@ -346,7 +363,7 @@ CC(=O)O,4
 
 ### 修改模型架構
 
-編輯 `model.py` 中的模型類別：
+編輯 `gruvae/models/gru_vae.py`（或 `transformer_vae.py`）中的模型類別：
 
 ```python
 # 增加潛在空間維度
@@ -359,16 +376,11 @@ model = GRUVAE(
 
 ### 調整訓練參數
 
-編輯 `train.py` 中的訓練配置：
+直接編輯 `configs/train.yaml`（或複製一份 `configs/my_config.yaml` 再用 `--config` 指定），不需要動程式碼：
 
-```python
-# 調整 KL 權重
-trainer = Trainer(
-    model=model,
-    tokenizer=tokenizer,
-    ...
-    kl_weight=0.05,  # 從 0.1 改為 0.05
-)
+```yaml
+training:
+  kl_weight_end: 0.05  # 從 0.01 改為 0.05
 ```
 
 ### 使用 GPU 訓練

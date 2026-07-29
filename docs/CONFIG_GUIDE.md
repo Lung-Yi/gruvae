@@ -12,7 +12,7 @@ GRU-VAE 訓練系統現在支援使用 YAML 配置檔案來管理所有超參數
 python train.py
 ```
 
-這會自動使用 `train.yaml` 作為配置檔案。
+這會自動使用 `configs/train.yaml` 作為配置檔案。
 
 ### 2. 使用自訂配置檔案
 
@@ -22,7 +22,7 @@ python train.py --config my_config.yaml
 
 ## 配置檔案結構
 
-### 完整配置範例 (`train.yaml`)
+### 完整配置範例 (`configs/train.yaml`)
 
 ```yaml
 # GRU-VAE 訓練配置檔案
@@ -322,7 +322,7 @@ KeyError: 'learning_rate'
 ```
 
 **解決方法:**
-確保配置檔案包含所有必要的參數。參考 `train.yaml` 模板。
+確保配置檔案包含所有必要的參數。參考 `configs/train.yaml` 模板。
 
 ## 進階用法
 
@@ -332,7 +332,7 @@ KeyError: 'learning_rate'
 
 ```bash
 # 計劃功能 (未實作)
-python train.py --config train.yaml --lr 0.0005 --batch_size 128
+python train.py --config configs/train.yaml --lr 0.0005 --batch_size 128
 ```
 
 ### 2. 配置繼承
@@ -362,7 +362,7 @@ model:
 - ✅ 支援版本控制
 
 建議流程:
-1. 從 `train.yaml` 開始
+1. 從 `configs/train.yaml` 開始
 2. 複製並修改為自己的配置
 3. 使用 `--config` 參數指定配置
 4. 記錄實驗結果

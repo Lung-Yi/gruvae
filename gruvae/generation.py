@@ -8,9 +8,9 @@ import yaml
 import torch
 import numpy as np
 from typing import List, Tuple, Dict
-from tokenizer import SmilesTokenizer, canonicalize_smiles
-from dataset import collate_fn, pad_to_len
-from model import GRUVAE
+from .tokenizer import SmilesTokenizer, canonicalize_smiles
+from .dataset import collate_fn, pad_to_len
+from .models.gru_vae import GRUVAE
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
@@ -315,15 +315,15 @@ def test_generator():
 
     # 載入 tokenizer
     tokenizer = SmilesTokenizer()
-    tokenizer.load('./checkpoints/tokenizer.json')
+    tokenizer.load('./checkpoints/gru/tokenizer.json')
 
     # 初始化生成器 (從檢查點載入模式)
     generator = VAEMoleculeGenerator(
         tokenizer=tokenizer,
         max_length=128,
-        config_path='train.yaml',
-        tokenizer_path='./checkpoints/tokenizer.json',
-        checkpoint_path='./checkpoints/checkpoint_epoch_20.pt'
+        config_path='configs/train.yaml',
+        tokenizer_path='./checkpoints/gru/tokenizer.json',
+        checkpoint_path='./checkpoints/gru/checkpoint_epoch_20.pt'
     )
 
     # 測試 1: 隨機採樣生成分子

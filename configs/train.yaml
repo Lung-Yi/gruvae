@@ -2,7 +2,7 @@
 
 # 資料設定
 data:
-  train_csv: './data/train_small_processed.csv'
+  train_csv: './data/processed/train_small_processed.csv'
   train_split: 0.9  # 訓練集比例
   max_length: 50   # 最大序列長度
 
@@ -48,7 +48,7 @@ validation:
 
 # 檢查點設定
 checkpoint:
-  save_dir: './checkpoints_small'
+  save_dir: './checkpoints/small'
   save_interval: 3     # 每幾個 epoch 保存一次
 
 # 設備設定

@@ -13,13 +13,13 @@
 ### 1. 導入和初始化
 
 ```python
-from molecule_generator import VAEMoleculeGenerator
+from gruvae.generation import VAEMoleculeGenerator
 
 # 初始化生成器
 generator = VAEMoleculeGenerator(
-    config_path='train.yaml',
-    tokenizer_path='./checkpoints/tokenizer.json',
-    checkpoint_path='./checkpoints/best_model.pt'
+    config_path='configs/train.yaml',
+    tokenizer_path='./checkpoints/gru/tokenizer.json',
+    checkpoint_path='./checkpoints/gru/best_model.pt'
 )
 ```
 
@@ -53,7 +53,7 @@ VAEMoleculeGenerator(
 ```
 
 **參數:**
-- `config_path`: 訓練配置檔案路徑 (train.yaml)
+- `config_path`: 訓練配置檔案路徑 (configs/train.yaml)
 - `tokenizer_path`: tokenizer 檔案路徑 (tokenizer.json)
 - `checkpoint_path`: 模型檢查點路徑 (.pt 檔案)
 - `device`: 計算設備 ('cuda' 或 'cpu'，預設自動偵測)
@@ -61,9 +61,9 @@ VAEMoleculeGenerator(
 **範例:**
 ```python
 generator = VAEMoleculeGenerator(
-    config_path='train.yaml',
-    tokenizer_path='./checkpoints/tokenizer.json',
-    checkpoint_path='./checkpoints/best_model.pt',
+    config_path='configs/train.yaml',
+    tokenizer_path='./checkpoints/gru/tokenizer.json',
+    checkpoint_path='./checkpoints/gru/best_model.pt',
     device='cuda'  # 可選，自動偵測
 )
 ```
@@ -307,15 +307,15 @@ for i, idx in enumerate(top_indices, 1):
 ### 範例 1: 生成和篩選分子
 
 ```python
-from molecule_generator import VAEMoleculeGenerator
+from gruvae.generation import VAEMoleculeGenerator
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 # 初始化
 generator = VAEMoleculeGenerator(
-    config_path='train.yaml',
-    tokenizer_path='./checkpoints/tokenizer.json',
-    checkpoint_path='./checkpoints/best_model.pt'
+    config_path='configs/train.yaml',
+    tokenizer_path='./checkpoints/gru/tokenizer.json',
+    checkpoint_path='./checkpoints/gru/best_model.pt'
 )
 
 # 生成 100 個分子
@@ -401,7 +401,7 @@ plt.show()
 運行內建測試:
 
 ```bash
-python molecule_generator.py
+python -m gruvae.generation
 ```
 
 這會執行所有功能的測試並顯示結果。
@@ -418,7 +418,7 @@ python molecule_generator.py
 ### 問題 1: 找不到檔案
 
 ```
-FileNotFoundError: [Errno 2] No such file or directory: 'train.yaml'
+FileNotFoundError: [Errno 2] No such file or directory: 'configs/train.yaml'
 ```
 
 **解決方法**: 確保配置檔案、tokenizer 和模型檔案路徑正確。
@@ -433,9 +433,9 @@ RuntimeError: CUDA out of memory
 ```python
 # 使用 CPU
 generator = VAEMoleculeGenerator(
-    config_path='train.yaml',
-    tokenizer_path='./checkpoints/tokenizer.json',
-    checkpoint_path='./checkpoints/best_model.pt',
+    config_path='configs/train.yaml',
+    tokenizer_path='./checkpoints/gru/tokenizer.json',
+    checkpoint_path='./checkpoints/gru/best_model.pt',
     device='cpu'
 )
 

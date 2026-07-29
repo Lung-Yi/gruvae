@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from typing import List, Tuple, Optional
-from tokenizer import SmilesTokenizer, randomize_smiles, canonicalize_smiles
+from .tokenizer import SmilesTokenizer, randomize_smiles, canonicalize_smiles
 
 def pad_to_len(seq, max_len, pad_id):
     """Pad or truncate sequence to max_len. Accepts both list and tensor."""
@@ -156,7 +156,7 @@ def get_dataloader(
 
 if __name__ == "__main__":
     # 測試 Dataset
-    from tokenizer import SmilesTokenizer
+    from gruvae.tokenizer import SmilesTokenizer
 
     # 建立 tokenizer
     tokenizer = SmilesTokenizer()
