@@ -5,6 +5,11 @@ data:
   train_csv: './data/processed/train_small_processed.csv'
   train_split: 0.9
   max_length: 50
+  # 訓練時是否每次取用都用 RDKit 重新隨機化 SMILES 書寫法 (SMILES enumeration)。
+  # 這是 REINVENT 系列論文 (Bjerrum 2017; Arus-Pous et al. 2019) 驗證過有效的資料增強，
+  # 能增加生成分子的多樣性、降低對特定 canonical 寫法的過擬合。驗證集不受此設定影響，
+  # 固定用 canonical 寫法以確保 val loss/perplexity 每個 epoch 可以互相比較。
+  randomize_smiles: true
 
 # 模型架構
 model:

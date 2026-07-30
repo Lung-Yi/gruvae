@@ -11,7 +11,7 @@ import torch.optim as optim
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import random
 
 from .tokenizer import SmilesTokenizer
@@ -255,6 +255,11 @@ def main(config_path='configs/train_reinvent.yaml'):
     print("\n建立 Dataset...")
     max_length = config['data']['max_length']
     train_split = config['data']['train_split']
+    # 訓練時是否每次取用都用 RDKit 重新隨機化 SMILES 書寫法（SMILES enumeration，
+    # 一種資料增強：同一個分子在不同 epoch 看到的書寫法不同，能增加生成多樣性、
+    # 降低對特定 canonical 寫法的過擬合）；驗證集固定用 canonical 寫法，
+    # 確保 val loss/perplexity 每個 epoch 的量測基準一致、可以互相比較
+    randomize_training_smiles = config['data'].get('randomize_smiles', True)
 
     property_guided_config = config.get('property_guided', {})
     pg_enabled = property_guided_config.get('enabled', False)
@@ -272,13 +277,16 @@ def main(config_path='configs/train_reinvent.yaml'):
         shuffled_smiles = filtered_smiles_list[:]
         random.shuffle(shuffled_smiles)
         train_size = int(train_split * len(shuffled_smiles))
-        train_dataset = DynamicSmilesLMDataset(shuffled_smiles[:train_size])
-        val_dataset = DynamicSmilesLMDataset(shuffled_smiles[train_size:])
+        train_dataset = DynamicSmilesLMDataset(shuffled_smiles[:train_size], randomize=randomize_training_smiles)
+        val_dataset = DynamicSmilesLMDataset(shuffled_smiles[train_size:], randomize=False)
     else:
-        dataset = SmilesLMDataset(train_csv, tokenizer, max_length=max_length)
-        train_size = int(train_split * len(dataset))
-        val_size = len(dataset) - train_size
-        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+        # 直接切 smiles list 分別建兩個 Dataset（而不是用 random_split 包同一個 Dataset 實例），
+        # 這樣訓練集/驗證集才能各自套用不同的 randomize 設定
+        shuffled_smiles = smiles_list[:]
+        random.shuffle(shuffled_smiles)
+        train_size = int(train_split * len(shuffled_smiles))
+        train_dataset = SmilesLMDataset(smiles_list=shuffled_smiles[:train_size], randomize=randomize_training_smiles)
+        val_dataset = SmilesLMDataset(smiles_list=shuffled_smiles[train_size:], randomize=False)
 
     print(f"訓練集: {len(train_dataset)}, 驗證集: {len(val_dataset)}")
 

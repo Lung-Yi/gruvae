@@ -14,6 +14,9 @@ data:
   train_csv: './data/processed/train_small_processed.csv'
   train_split: 0.9
   max_length: 50
+  # 訓練時是否每次取用都用 RDKit 重新隨機化 SMILES 書寫法 (SMILES enumeration)，
+  # 對監督式訓練那部分的資料（含動態訓練池）有效；驗證集固定用 canonical 寫法
+  randomize_smiles: true
 
 # 模型架構
 model:

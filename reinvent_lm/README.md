@@ -157,7 +157,16 @@ Cn1cnc2c1c(=O)n(CC(O)CO)c(=O)n2C,18
 - 不需要事先分詞/建 vocab，`SmilesTokenizer.build_vocab()` 會在 `main()` 執行時自動從
   這批 SMILES 建立詞彙表（除非用 `checkpoint.load_from` 載入已有模型，這時會改成沿用
   該模型旁邊的 `tokenizer.json`，見下方說明）。
-- SMILES 不需要事先 canonicalize，`Dataset` 內部會用 `canonicalize_smiles()` 自動處理。
+- SMILES 不需要事先 canonicalize，`Dataset` 內部會自動處理。訓練集預設（`data.randomize_smiles: true`）
+  每次取用都會用 RDKit 重新隨機化書寫法（SMILES enumeration）而不是固定用 canonical 寫法——
+  同一個分子有非常多種合法但原子順序不同的寫法，只用單一 canonical 寫法訓練容易讓模型記住
+  表面模式而非真正的分子語法規則。這是 Bjerrum (2017) 與 Arús-Pous et al. (2019，J.
+  Cheminformatics) 針對這類 autoregressive SMILES 生成模型驗證過的資料增強法，能讓生成
+  出來的獨特分子數量明顯增加。因為 `DataLoader` 每個 epoch 本來就會重新呼叫一次
+  `Dataset.__getitem__`，這個隨機化是「即時」做的（不像原始 REINVENT 官方實作那樣需要
+  事先產生好多份枚舉檔案再輪流讀取），成本跟原本呼叫一次 canonicalize 差不多。驗證集固定
+  用 canonical 寫法（`randomize` 參數為 `False`），確保每個 epoch 的 val loss/perplexity
+  量測基準一致、可以互相比較。
 
 ---
 
@@ -215,6 +224,7 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 | `data` | `train_csv` | 訓練資料 CSV 路徑，須含 `smiles` 欄 |
 | | `train_split` | 訓練/驗證切分比例（例如 0.9 = 90% 訓練） |
 | | `max_length` | SMILES 序列的最大 token 長度（含 START/END），超過會被截斷 |
+| | `randomize_smiles` | 預設 `true`。訓練時每次取用是否用 RDKit 重新隨機化 SMILES 書寫法（SMILES enumeration，見下方說明）；驗證集不受影響，固定用 canonical 寫法 |
 | `model` | `embedding_dim` | token embedding 維度 |
 | | `hidden_dim` | GRU hidden state 維度 |
 | | `num_layers` | GRU 層數 |
