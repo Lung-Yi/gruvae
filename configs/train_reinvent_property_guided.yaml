@@ -1,0 +1,100 @@
+# REINVENT 風格 GRU decoder-only 語言模型 Property-Guided RL 訓練配置檔案
+# 用法: python train_reinvent.py --config configs/train_reinvent_property_guided.yaml
+#
+# 開啟 property_guided.enabled 後：
+#   1. 訓練資料在一開始就會先用 filter_api 過濾過，只保留符合結構規則的 SMILES
+#   2. warmup 結束後每個 epoch 會額外用目前的模型採樣一批分子（從 BOS 開始自回歸生成），
+#      依「結構規則(filter_api)」+「性質目標(target_spec) 的 pareto front 排序」算 reward，
+#      做 REINFORCE 微調
+#   3. 通過結構規則的分子會被拿去更新一個動態訓練池，直接同步進實際的訓練資料
+#   4. 每一輪 front 1（最好的一層）的分子結構與性質會寫進 property_guided.front1_log_path
+
+# 資料設定
+data:
+  train_csv: './data/processed/train_small_processed.csv'
+  train_split: 0.9
+  max_length: 50
+
+# 模型架構
+model:
+  embedding_dim: 256
+  hidden_dim: 512
+  num_layers: 3
+  dropout: 0.1
+
+# 訓練參數
+training:
+  num_epochs: 100
+  batch_size: 128
+  learning_rate: 0.001
+  num_workers: 0
+  grad_clip_max_norm: 1.0
+
+# 驗證設定
+validation:
+  num_sample: 10
+
+# 檢查點設定
+checkpoint:
+  save_dir: './checkpoints/reinvent_property_guided'
+  save_interval: 5
+  load_from: './checkpoints/reinvent_small/best_model.pt'   # 從預訓練好的 SmilesLM 開始做 RL 微調
+
+# 設備設定
+device:
+  use_cuda: true
+
+# 隨機種子
+seed: 42
+
+# ------------------------------------------------------------------
+# Property-Guided RL 訓練設定
+# ------------------------------------------------------------------
+property_guided:
+  enabled: true
+
+  max_length: 50
+
+  num_samples_per_round: 1024
+  num_rl_rounds_per_epoch: 2
+
+  # 前幾個 epoch 只做原本的監督式訓練，之後才開始 RL 微調
+  warmup_epochs: 10
+
+  # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
+  reward_invalid: -2.0
+  reward_structure_fail: -1.0
+  reward_pass_base: 1.0
+  reward_pass_max: 2.0
+
+  # Prior regularization 權重，防止 RL 微調時生成多樣性崩潰 (mode collapse)
+  prior_kl_weight: 0.1
+
+  # multinomial 採樣溫度，越高越隨機/多樣，越低越接近 greedy
+  sampling_temperature: 1.0
+
+  # 結構規則過濾器 (filter_api) 的參數
+  structure_filter:
+    max_ring_size: 8
+    max_heavy_atoms: 60
+    min_heavy_atoms: 2
+    desired_smarts:
+      - "[#7]1~[#7]~[#6]~[#6]~[#6]1"
+    # require_all_desired: true
+
+  # 分子性質目標 (target_spec)
+  target_spec:
+    ClogP:
+      goal: range
+      low: 5.0
+      high: 6.5
+    SAScore:
+      goal: minimize
+
+  # 動態訓練資料：把「持續勝出」的合規分子直接同步進實際的訓練資料集
+  dynamic_training_data:
+    enabled: true
+    max_pool_size: 5000
+
+  # Front 1 分子的 CSV log 路徑，不填則預設存在 checkpoint.save_dir 底下的 front1_log.csv
+  front1_log_path: null

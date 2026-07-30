@@ -36,8 +36,8 @@ training:
   num_workers: 0
 
   # KL Annealing 設定
-  kl_weight_start: 0.0
-  kl_weight_end: 0.01
+  kl_weight_start: 0.01
+  kl_weight_end: 0.50
   kl_anneal_epochs: 50
 
   # 梯度裁剪
@@ -74,11 +74,11 @@ property_guided:
 
   # 每個 RL round 取樣幾個分子 / 每個 epoch 跑幾個 RL round
   num_samples_per_round: 2048
-  num_rl_rounds_per_epoch: 2
+  num_rl_rounds_per_epoch: 10
 
   # 前幾個 epoch 只做原本的監督式訓練，讓模型先學會基本合法的 SMILES 語法，
   # 之後才開始 RL 微調（太早開始 pareto 篩選/自我訓練意義不大甚至有害）
-  warmup_epochs: 0
+  warmup_epochs: 20
 
   # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
   reward_invalid: -2.0
@@ -100,7 +100,7 @@ property_guided:
     # forbidden_smarts:            # 黑名單，符合其中任何一個就濾掉；不填則用內建的預設示範規則
     #   - "[N;R0]=[N;R0]=[N;R0]"
     desired_smarts:               # 白名單/必要結構，分子要符合這裡的規則才會通過；不填則不限制
-      - "[#7]1~[#7]~[#6]~[#6]~[#6]1"                # 例如要求一定要含有苯環
+      - "[#7]1~[#7]~[#6]~[#6]~[#6]1"                # 例如要求一定要含有某個子結構
     # require_all_desired: true     # desired_smarts 要全部都符合(true) 還是符合一個就好(false)
 
   # 分子性質目標 (target_spec)：每個性質可以是

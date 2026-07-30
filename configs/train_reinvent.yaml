@@ -1,0 +1,40 @@
+# REINVENT 風格 GRU decoder-only 語言模型 訓練配置檔案
+
+# 資料設定
+data:
+  train_csv: './data/processed/train_small_processed.csv'
+  train_split: 0.9
+  max_length: 50
+
+# 模型架構
+model:
+  embedding_dim: 256
+  hidden_dim: 512
+  num_layers: 3
+  dropout: 0.1
+
+# 訓練參數
+training:
+  num_epochs: 50
+  batch_size: 128
+  learning_rate: 0.001
+  num_workers: 0
+  grad_clip_max_norm: 1.0
+
+# 驗證設定
+validation:
+  num_sample: 10       # 每個 epoch 生成幾個分子來算 validity rate
+
+# 檢查點設定
+checkpoint:
+  save_dir: './checkpoints/reinvent_small'
+  save_interval: 5
+  load_from: null      # 設定 .pt 檔案路徑會先載入該模型權重繼續訓練/微調
+                        # （會自動嘗試載入同目錄下的 tokenizer.json，確保詞彙表一致）
+
+# 設備設定
+device:
+  use_cuda: true
+
+# 隨機種子
+seed: 42
