@@ -4,7 +4,7 @@ SmilesLM 分子生成器
 """
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import yaml
 import torch
@@ -14,7 +14,7 @@ from rdkit import Chem
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
-from .tokenizer import SmilesTokenizer, canonicalize_smiles
+from .tokenizer import SmilesTokenizer, canonicalize_smiles, randomize_smiles
 from .models.lm import SmilesLM
 from .pareto import PropertySpec, assign_pareto_fronts
 
@@ -124,68 +124,99 @@ class MoleculeGenerator:
 
     def sample_from_prefix(
         self,
-        smiles: str,
+        smiles: Union[str, List[str]],
         num_samples: int,
         truncate_fraction: Optional[float] = None,
         truncate_fraction_range: tuple = (0.3, 0.7),
+        randomize_input: bool = True,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
-    ) -> List[str]:
+    ) -> Union[List[str], List[List[str]]]:
         """
         把種子分子的 SMILES 截斷到某個比例當 prefix，讓模型接續自回歸生成剩下的部分，
         藉此在沒有連續潛在空間的情況下做「鄰近結構探索」。
 
         Args:
-            smiles: 種子分子的 SMILES
-            num_samples: 要生成幾個鄰近分子
+            smiles: 單一種子 SMILES，或一個 SMILES list——給 list 時會分別對每一個輸入
+                各自做鄰近探索（互不影響）
+            num_samples: 「每個」種子分子要生成幾個鄰近分子
             truncate_fraction: 截斷比例（0~1），不填則每個樣本各自在
                 truncate_fraction_range 範圍內隨機挑一個比例（更多樣）
             truncate_fraction_range: truncate_fraction 為 None 時的隨機範圍
+            randomize_input: 是否在截斷前，先用 RDKit 對種子分子做一次隨機化 SMILES
+                重新表示（`Chem.MolToSmiles(doRandom=True)`，即 SMILES enumeration）。
+                同一個分子有非常多種合法但原子順序不同的書寫方式，從同一個比例截斷，
+                不同的書寫方式會切到不同的子結構，能大幅增加鄰近探索的多樣性
+                （每個樣本各自獨立抽一次新的隨機表示法，不是整批共用同一個）
             sampling_mode: 'greedy' 或 'multinomial'
             temperature: multinomial 模式下的取樣溫度
 
         Returns:
-            鄰近分子的 SMILES 列表（prefix 部分保持不變，之後是模型接續生成的內容）
+            smiles 為單一字串時：List[str]（長度 num_samples）
+            smiles 為 list 時：List[List[str]]，跟輸入的 smiles list 順序一一對應，
+                每個子 list 長度都是 num_samples
         """
         self.model.eval()
-        base_indices = self.tokenizer.encode(smiles, add_special_tokens=False)
-        if len(base_indices) < 2:
-            raise ValueError(f"分子太短，無法截斷探索: {smiles}")
+        single_input = isinstance(smiles, str)
+        smiles_list = [smiles] if single_input else list(smiles)
 
-        # 同一次呼叫用同一個截斷長度：這樣整個 batch 的 prefix 長度一致，
-        # teacher forcing 取得的 hidden state 不需要靠 padding 湊齊，
-        # 避免補的 token 汙染 hidden state（每個樣本各自截斷長度不同時，
-        # 短的 prefix 得額外塞假 token 才能跟長的一起 batch，那樣算出來的 hidden state
-        # 就不是「剛好處理完真正 prefix」那個狀態了）
         low, high = truncate_fraction_range
-        fraction = truncate_fraction if truncate_fraction is not None else np.random.uniform(low, high)
-        cut = max(1, min(len(base_indices), round(len(base_indices) * fraction)))
-        prefix_tokens = [self.tokenizer.start_idx] + base_indices[:cut]
 
-        prefix_batch = torch.tensor(
-            [prefix_tokens] * num_samples, dtype=torch.long, device=self.device
-        )
+        # 每個 (seed, sample) 各自獨立決定：要不要重新隨機表示 -> 用哪個截斷比例 -> prefix token 序列。
+        # 不同樣本的 prefix 長度可能不一樣（隨機表示法的 token 數不保證跟原始 SMILES 相同），
+        # 所以不能像單一固定比例那樣全部塞進同一個 batch tensor；改成依「長度」分組，
+        # 同一組內長度一致才一起 batch teacher force，避免用 padding 湊長度污染 hidden state。
+        all_prefixes: List[List[int]] = []
+        owner: List[int] = []  # all_prefixes[i] 屬於哪個 seed（smiles_list 的 index）
+
+        for seed_idx, seed_smiles in enumerate(smiles_list):
+            for _ in range(num_samples):
+                source = randomize_smiles(seed_smiles) if randomize_input else seed_smiles
+                base_indices = self.tokenizer.encode(source, add_special_tokens=False)
+                if len(base_indices) < 2:
+                    # 隨機化失敗或分子過短時，退回用原始種子 SMILES
+                    base_indices = self.tokenizer.encode(seed_smiles, add_special_tokens=False)
+                if len(base_indices) < 2:
+                    raise ValueError(f"分子太短，無法截斷探索: {seed_smiles}")
+
+                fraction = truncate_fraction if truncate_fraction is not None else np.random.uniform(low, high)
+                cut = max(1, min(len(base_indices), round(len(base_indices) * fraction)))
+                all_prefixes.append([self.tokenizer.start_idx] + base_indices[:cut])
+                owner.append(seed_idx)
+
+        results_flat: List[Optional[str]] = [None] * len(all_prefixes)
+        length_groups: Dict[int, List[int]] = {}
+        for i, prefix_tokens in enumerate(all_prefixes):
+            length_groups.setdefault(len(prefix_tokens), []).append(i)
 
         with torch.no_grad():
-            continuations = self.model.generate_from_prefix(
-                prefix_batch,
-                max_length=self.max_length,
-                sampling_mode=sampling_mode,
-                temperature=temperature,
-            )
+            for indices in length_groups.values():
+                prefix_batch = torch.tensor(
+                    [all_prefixes[i] for i in indices], dtype=torch.long, device=self.device
+                )
+                continuations = self.model.generate_from_prefix(
+                    prefix_batch,
+                    max_length=self.max_length,
+                    sampling_mode=sampling_mode,
+                    temperature=temperature,
+                )
+                for j, i in enumerate(indices):
+                    full_tokens = all_prefixes[i][1:] + continuations[j].cpu().tolist()  # 去掉 START
+                    results_flat[i] = self.tokenizer.decode(full_tokens)
 
-        results = []
-        for i in range(num_samples):
-            full_tokens = prefix_tokens[1:] + continuations[i].cpu().tolist()  # 去掉 START
-            results.append(self.tokenizer.decode(full_tokens))
-        return results
+        grouped: List[List[str]] = [[] for _ in smiles_list]
+        for i, seed_idx in enumerate(owner):
+            grouped[seed_idx].append(results_flat[i])
+
+        return grouped[0] if single_input else grouped
 
     def generate_analogs(
         self,
-        smiles: str,
+        smiles: Union[str, List[str]],
         num_candidates: int = 100,
         truncate_fraction: Optional[float] = None,
         truncate_fraction_range: tuple = (0.3, 0.7),
+        randomize_input: bool = True,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
         filter_api=None,
@@ -195,58 +226,80 @@ class MoleculeGenerator:
         top_k: Optional[int] = None,
     ) -> pd.DataFrame:
         """
-        針對一個種子分子做「鄰近結構搜索」：用 sample_from_prefix 在附近取樣一批候選分子，
-        依序套用結構規則過濾 (filter_api) 與性質目標的 pareto front 排序 (target_spec)，
+        針對一個（或一批）種子分子做「鄰近結構搜索」：用 sample_from_prefix 在附近取樣候選
+        分子，依序套用結構規則過濾 (filter_api) 與性質目標的 pareto front 排序 (target_spec)，
         回傳排序後最好的候選分子。
 
+        給一個 SMILES list 時，所有種子的候選分子會被**合併成同一個候選池**一起去重複、
+        過濾、排序（而不是每個種子分開各自排序）——這樣可以直接把一組 lead 化合物丟進來，
+        一次拿到整組裡面「附近最好的候選」，回傳的 DataFrame 會多一欄 'seed' 標記每個
+        候選分子是從哪個種子生成的，需要的話可以自行用 `groupby('seed')` 拆開看。
+
         Args:
-            smiles: 種子分子的 SMILES
-            num_candidates: 取樣的候選分子數量
-            truncate_fraction / truncate_fraction_range / sampling_mode / temperature: 同 sample_from_prefix
+            smiles: 種子分子的 SMILES，或一個 SMILES list
+            num_candidates: 「每個」種子取樣的候選分子數量
+            truncate_fraction / truncate_fraction_range / randomize_input / sampling_mode / temperature:
+                同 sample_from_prefix
             filter_api: 結構規則過濾器，簽名為 filter_api(smiles_list) -> List[str]；不填則不過濾
             inference_api: 性質推論介面，需有 inference_pipeline(smiles_list, properties) -> DataFrame；
                 有提供 target_spec 時必填
             target_spec: {性質名稱: PropertySpec}，用來做 pareto front 排序；不填則不排序
-            dedupe: 是否對候選分子做 canonical 去重複，並排除跟種子分子本身相同的結果
+            dedupe: 是否對候選分子做 canonical 去重複，並排除跟任一個輸入種子分子相同的結果
             top_k: 只回傳排序後前 k 筆 (需搭配 target_spec)
 
         Returns:
-            DataFrame，欄位為 ['smiles']，有給 target_spec 時額外附上各性質欄位與 'front_rank'
+            DataFrame，欄位為 ['smiles', 'seed']，有給 target_spec 時額外附上各性質欄位與 'front_rank'
         """
-        candidates = self.sample_from_prefix(
-            smiles, num_candidates,
+        single_input = isinstance(smiles, str)
+        seed_list = [smiles] if single_input else list(smiles)
+
+        per_seed_candidates = self.sample_from_prefix(
+            seed_list, num_candidates,
             truncate_fraction=truncate_fraction,
             truncate_fraction_range=truncate_fraction_range,
+            randomize_input=randomize_input,
             sampling_mode=sampling_mode, temperature=temperature,
         )
 
-        valid_candidates = [s for s in candidates if Chem.MolFromSmiles(s) is not None]
+        candidate_rows = [
+            {'smiles': s, 'seed': seed}
+            for seed, candidates in zip(seed_list, per_seed_candidates)
+            for s in candidates
+        ]
+        candidate_rows = [row for row in candidate_rows if Chem.MolFromSmiles(row['smiles']) is not None]
 
         if dedupe:
-            seed_canonical = canonicalize_smiles(smiles)
+            seed_canonicals = {canonicalize_smiles(s) for s in seed_list}
             seen = set()
-            deduped = []
-            for s in valid_candidates:
-                canonical = canonicalize_smiles(s)
-                if canonical == seed_canonical or canonical in seen:
+            deduped_rows = []
+            for row in candidate_rows:
+                canonical = canonicalize_smiles(row['smiles'])
+                if canonical in seed_canonicals or canonical in seen:
                     continue
                 seen.add(canonical)
-                deduped.append(s)
-            valid_candidates = deduped
+                deduped_rows.append(row)
+            candidate_rows = deduped_rows
+
+        candidate_smiles = [row['smiles'] for row in candidate_rows]
+        candidate_seeds = [row['seed'] for row in candidate_rows]
 
         if filter_api is not None:
-            valid_candidates = filter_api(valid_candidates)
+            pass_set = set(filter_api(candidate_smiles))
+            keep = [i for i, s in enumerate(candidate_smiles) if s in pass_set]
+            candidate_smiles = [candidate_smiles[i] for i in keep]
+            candidate_seeds = [candidate_seeds[i] for i in keep]
 
-        if not valid_candidates:
-            return pd.DataFrame(columns=['smiles'])
+        if not candidate_smiles:
+            return pd.DataFrame(columns=['smiles', 'seed'])
 
         if target_spec is None:
-            return pd.DataFrame({'smiles': valid_candidates})
+            return pd.DataFrame({'smiles': candidate_smiles, 'seed': candidate_seeds})
 
         if inference_api is None:
             raise ValueError("提供 target_spec 時必須同時提供 inference_api")
 
-        prop_df = inference_api.inference_pipeline(valid_candidates, properties=list(target_spec.keys()))
+        prop_df = inference_api.inference_pipeline(candidate_smiles, properties=list(target_spec.keys()))
+        prop_df.insert(1, 'seed', candidate_seeds)
         objective_matrix = np.array([
             [target_spec[prop].to_objective(row[prop]) for prop in target_spec]
             for _, row in prop_df.iterrows()
@@ -292,6 +345,17 @@ def test_generator():
     print()
 
     print("=" * 80)
+    print("測試 2b: prefix 截斷接續生成，輸入一個 SMILES list")
+    print("=" * 80)
+    seed_list = ["CCOc1ccccc1", "CCN(CC)CC"]
+    neighbors_list = generator.sample_from_prefix(seed_list, num_samples=3)
+    for seed, neighbors_for_seed in zip(seed_list, neighbors_list):
+        print(f"  種子分子: {seed}")
+        for i, smiles in enumerate(neighbors_for_seed, 1):
+            print(f"    [{i}] {smiles}")
+    print()
+
+    print("=" * 80)
     print("測試 3: 鄰近分子搜索 (generate_analogs)")
     print("=" * 80)
     from .filters import StructureFilter
@@ -310,6 +374,24 @@ def test_generator():
     )
     print(f"  種子分子: {seed_smiles}")
     print(analogs_df)
+    print()
+
+    print("=" * 80)
+    print("測試 3b: 鄰近分子搜索，輸入一個 SMILES list (合併排序，附 'seed' 欄)")
+    print("=" * 80)
+    analogs_df_multi = generator.generate_analogs(
+        seed_list,
+        num_candidates=50,
+        filter_api=StructureFilter(),
+        inference_api=PropertyInferenceAPI(),
+        target_spec={
+            "ClogP": PropertySpec(goal="range", low=1.0, high=3.0),
+            "SAScore": PropertySpec(goal="minimize"),
+        },
+        top_k=8,
+    )
+    print(f"  種子分子: {seed_list}")
+    print(analogs_df_multi)
     print()
 
     print("=" * 80)

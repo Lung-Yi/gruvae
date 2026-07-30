@@ -362,7 +362,7 @@ generator = MoleculeGenerator(
 `'multinomial'`（依機率分布抽樣，有多樣性）或 `'greedy'`（每步都選機率最大的 token，
 結果是確定性的，多次呼叫會拿到一樣的分子）。
 
-### `sample_from_prefix(smiles, num_samples, truncate_fraction=None, truncate_fraction_range=(0.3, 0.7), sampling_mode='multinomial', temperature=1.0) -> List[str]`
+### `sample_from_prefix(smiles, num_samples, truncate_fraction=None, truncate_fraction_range=(0.3, 0.7), randomize_input=True, sampling_mode='multinomial', temperature=1.0) -> List[str] | List[List[str]]`
 
 因為這個架構**沒有連續潛在空間**，沒辦法像 VAE 那樣「編碼成 z、加點雜訊、解碼回來」做
 鄰近探索。這裡改用**截斷種子分子的 token 序列、讓模型接續自回歸生成剩下的部分**：
@@ -375,17 +375,27 @@ generator = MoleculeGenerator(
         模型從這裡開始自回歸接續生成 ──▶ "CCOc1ccc(S(=O)(=O)NC(C)(C#N)CCC#N)cc1"
 ```
 
-同一次呼叫（同一個種子分子）內，所有 `num_samples` 個候選都用**同一個**隨機挑選的截斷
-比例（不填 `truncate_fraction` 時會在 `truncate_fraction_range` 範圍內隨機挑一個），這樣
-整個 batch 的 prefix 長度一致，可以一次 teacher force 拿到正確的 hidden state 再接續生成，
-不需要靠 padding 湊長度（padding 湊出來的 hidden state 會混進不該存在的 token，等於汙染
-了接續生成的起點）。想要更多樣的截斷長度，可以多呼叫幾次這個方法。
+`smiles` 可以是**單一字串**（回傳 `List[str]`，長度 `num_samples`），也可以是**一個
+SMILES list**（回傳 `List[List[str]]`，跟輸入順序一一對應，每個子 list 長度都是
+`num_samples`）——給 list 時會分別對每一個輸入各自做鄰近探索，互不影響。
 
-### `generate_analogs(smiles, num_candidates=100, ..., filter_api=None, inference_api=None, target_spec=None, dedupe=True, top_k=None) -> pd.DataFrame`
+**`randomize_input=True`（預設開啟）：SMILES enumeration 增加多樣性**。因為同一個分子
+可以有非常多種合法但原子書寫順序不同的 SMILES 表示法，若每次都截斷同一個固定的（canonical）
+寫法，切出來的子結構永遠是同一批。開啟這個選項後，每個樣本在截斷前都會先用 RDKit 重新做
+一次隨機書寫（`Chem.MolToSmiles(doRandom=True)`，即 `tokenizer.randomize_smiles`），
+同一個分子因此會從不同的「切點」暴露出不同的子結構，能大幅增加鄰近探索的多樣性；不想要
+這個效果的話設 `randomize_input=False` 即可（例如你想精準控制截斷的是原始輸入字串本身）。
+
+實作上：每個樣本各自獨立抽「要不要隨機重寫」→「用哪個截斷比例」→ 得到自己的 prefix
+token 序列，長度可能都不一樣（不同隨機書寫法的 token 數不保證相同）。程式會依 prefix
+長度分組，同一組內長度一致才一起 batch 做 teacher forcing，避免長度不同時得靠 padding
+湊齊、進而汙染 hidden state 的問題。
+
+### `generate_analogs(smiles, num_candidates=100, ..., randomize_input=True, filter_api=None, inference_api=None, target_spec=None, dedupe=True, top_k=None) -> pd.DataFrame`
 
 把 `sample_from_prefix` 取樣、去重複/去無效、`filter_api` 結構過濾、
-`inference_api` + `target_spec` 的 pareto front 排序串起來，一次做完「找一個分子附近
-更好的候選」：
+`inference_api` + `target_spec` 的 pareto front 排序串起來，一次做完「找一個（或一批）
+分子附近更好的候選」：
 
 ```python
 from reinvent_lm.filters import StructureFilter
@@ -393,8 +403,8 @@ from reinvent_lm.properties import PropertyInferenceAPI
 from reinvent_lm.pareto import PropertySpec
 
 df = generator.generate_analogs(
-    "CCOc1ccccc1",
-    num_candidates=100,
+    ["CCOc1ccccc1", "CCN(CC)CC"],   # 也可以只給單一字串
+    num_candidates=100,             # 「每個」種子取樣的候選數
     filter_api=StructureFilter(),
     inference_api=PropertyInferenceAPI(),
     target_spec={
@@ -405,10 +415,14 @@ df = generator.generate_analogs(
 )
 ```
 
-回傳的 `DataFrame` 欄位為 `['smiles']`（沒給 `target_spec` 時），或
-`['smiles', <性質欄位...>, 'front_rank']`（`front_rank` 越小代表越好，`top_k` 只取排序
-後前幾筆）。`filter_api`/`inference_api` 不填的話就不做結構過濾/性質排序，只回傳
-去重複、去無效之後的候選分子。
+`smiles` 給一個 list 時，**所有種子的候選分子會合併成同一個候選池一起去重複、過濾、
+排序**（而不是每個種子分開各自排序），可以直接把一組 lead 化合物丟進來，一次拿到整組
+裡面「附近最好的候選」。回傳的 `DataFrame` 欄位為 `['smiles', 'seed']`（沒給
+`target_spec` 時），或 `['smiles', 'seed', <性質欄位...>, 'front_rank']`
+（`front_rank` 越小代表越好，`top_k` 只取排序後前幾筆）。`seed` 欄記錄每個候選分子是
+從哪個輸入種子生成的，需要的話可以自行 `df.groupby('seed')` 拆開看；`dedupe=True` 時
+會排除跟**任一個**輸入種子相同的候選。`filter_api`/`inference_api` 不填的話就不做結構
+過濾/性質排序，只回傳去重複、去無效之後的候選分子。
 
 ---
 
