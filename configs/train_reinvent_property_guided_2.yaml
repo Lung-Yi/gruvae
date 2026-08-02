@@ -39,7 +39,7 @@ validation:
 
 # 檢查點設定
 checkpoint:
-  save_dir: './checkpoints/reinvent_property_guided'
+  save_dir: './checkpoints/reinvent_property_guided_2'
   save_interval: 5
   load_from: './checkpoints/reinvent_small/best_model.pt'   # 從預訓練好的 SmilesLM 開始做 RL 微調
 
@@ -59,18 +59,14 @@ property_guided:
   max_length: 50
 
   num_samples_per_round: 1024
-  num_rl_rounds_per_epoch: 2
+  num_rl_rounds_per_epoch: 20
 
   # 前幾個 epoch 只做原本的監督式訓練，之後才開始 RL 微調
-  warmup_epochs: 10
+  warmup_epochs: 5
 
-  # warmup 結束、RL 開始之後，是否每個 epoch 仍要做一次監督式訓練（train_epoch）。
-  # true（預設）：跟原本行為一樣，監督式訓練 + RL 同時進行。
-  # false：warmup 結束後只靠 RL（loss_pg + prior 正則化）更新模型，不再穿插監督式訓練，
-  #        跟 REINVENT 原版 Agent 微調階段的做法一致。這個設定不影響 warmup 期間
-  #        （warmup 本身就是監督式訓練）。設 false 時動態訓練池仍會照常累積，
-  #        但不會再被拿去訓練，可視情況一併關掉 dynamic_training_data.enabled。
-  supervised_training_during_rl: true
+  # warmup 結束、RL 開始之後，是否每個 epoch 仍要做一次監督式訓練（詳見
+  # train_reinvent_property_guided.yaml 的註解）
+  supervised_training_during_rl: false
 
   # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
   reward_invalid: -2.0
@@ -79,10 +75,10 @@ property_guided:
   reward_pass_max: 2.0
 
   # Prior regularization 權重，防止 RL 微調時生成多樣性崩潰 (mode collapse)
-  prior_kl_weight: 0.1
+  prior_kl_weight: 0.5
 
   # multinomial 採樣溫度，越高越隨機/多樣，越低越接近 greedy
-  sampling_temperature: 1.0
+  sampling_temperature: 1.5
 
   # 結構規則過濾器 (filter_api) 的參數
   structure_filter:
@@ -90,8 +86,9 @@ property_guided:
     max_heavy_atoms: 60
     min_heavy_atoms: 2
     desired_smarts:
-      - "[#7]1~[#7]~[#6]~[#6]~[#6]1"
-    # require_all_desired: true
+      - "[C](=[O])-[N]"
+      - "c1ccccc1"
+    require_all_desired: true
 
   # 分子性質目標 (target_spec)
   target_spec:
@@ -100,12 +97,18 @@ property_guided:
       low: 5.0
       high: 6.5
     SAScore:
-      goal: minimize
+      goal: range
+      low: 1.5
+      high: 2.5
+    MolWt:
+      goal: range
+      low: 380
+      high: 470
 
   # 動態訓練資料：把「持續勝出」的合規分子直接同步進實際的訓練資料集
   dynamic_training_data:
-    enabled: true
-    max_pool_size: 5000
+    enabled: false
+    max_pool_size: 10000
 
   # Front 1 分子的 CSV log 路徑，不填則預設存在 checkpoint.save_dir 底下的 front1_log.csv
   front1_log_path: null

@@ -15,15 +15,16 @@ autoregressive 語言模型（比照 Olivecrona et al. 2017 / Blaschke et al. 20
 1. [這個專案在做什麼](#這個專案在做什麼)
 2. [架構與訓練原理](#架構與訓練原理)
 3. [專案結構](#專案結構)
-4. [安裝需求](#安裝需求)
-5. [資料格式](#資料格式)
-6. [快速開始](#快速開始)
-7. [YAML 設定檔詳細說明](#yaml-設定檔詳細說明)
-8. [Property-Guided RL 微調原理](#property-guided-rl-微調原理)
-9. [MoleculeGenerator API](#moleculegenerator-api)
-10. [Checkpoint 格式](#checkpoint-格式)
-11. [跟 gruvae (VAE) 的差異對照](#跟-gruvae-vae-的差異對照)
-12. [常見問題 / 訓練監控指標](#常見問題--訓練監控指標)
+4. [元件依賴關係圖 (Class Diagram)](#元件依賴關係圖-class-diagram)
+5. [安裝需求](#安裝需求)
+6. [資料格式](#資料格式)
+7. [快速開始](#快速開始)
+8. [YAML 設定檔詳細說明](#yaml-設定檔詳細說明)
+9. [Property-Guided RL 微調原理](#property-guided-rl-微調原理)
+10. [MoleculeGenerator API](#moleculegenerator-api)
+11. [Checkpoint 格式](#checkpoint-格式)
+12. [跟 gruvae (VAE) 的差異對照](#跟-gruvae-vae-的差異對照)
+13. [常見問題 / 訓練監控指標](#常見問題--訓練監控指標)
 
 ---
 
@@ -124,6 +125,198 @@ train_reinvent.py        # 根目錄的訓練入口腳本
 每個檔案底部都有 `if __name__ == "__main__":` 的煙霧測試，可以用
 `python -m reinvent_lm.<module>`（例如 `python -m reinvent_lm.models.lm`）單獨執行，
 快速確認該模組本身邏輯正確。
+
+---
+
+## 元件依賴關係圖 (Class Diagram)
+
+這個 codebase 有**兩條互相獨立的入口**：訓練（從 `train_reinvent.py` 出發）跟推論
+（從 `MoleculeGenerator` 出發），共用同一組底層元件（`SmilesTokenizer`/`SmilesLM`/
+`filters`/`properties`/`pareto`）。下面兩張圖分別呈現「執行流程」跟「靜態物件關係」。
+
+### 1. 從 `main()` 出發的執行流程
+
+```mermaid
+flowchart TD
+    CLI["train_reinvent.py\n(命令列入口, argparse --config)"] --> MAIN["training.main(config_path)"]
+
+    MAIN --> LOADCFG["load_config()\n讀 YAML"]
+    MAIN --> TOK["SmilesTokenizer\nload_from 有值 -> load()\n否則 -> build_vocab()"]
+    MAIN --> DS["SmilesLMDataset /\nDynamicSmilesLMDataset\n(train/val 各自不同 randomize 設定)"]
+    DS --> DL["DataLoader\n(collate_fn 綁定 tokenizer)"]
+    MAIN --> MODEL["SmilesLM\n建立 + (可選) load_from 權重"]
+
+    MAIN -->|"property_guided.enabled = false"| TR["Trainer(model, tokenizer, train_loader, val_loader, ...)"]
+    TR --> LOOP1["trainer.train(num_epochs)\n= train_epoch() + validate() 每 epoch"]
+
+    MAIN -->|"property_guided.enabled = true"| BSF["build_structure_filter(pg_config)"]
+    BSF --> SF["StructureFilter\n(先過濾一次訓練資料)"]
+    MAIN --> BPT["build_property_guided_trainer(...)"]
+    BPT --> PIA["PropertyInferenceAPI"]
+    BPT --> PS["PropertySpec\n(每個 target_spec 性質各一個)"]
+    BPT --> PGT["PropertyGuidedLMTrainer\n(繼承 Trainer)"]
+
+    PGT --> LOOP2["trainer.train(num_epochs)\n每 epoch: train_epoch() + validate()\n+ warmup 後每輪 run_rl_round()"]
+    LOOP2 --> RL["run_rl_round()"]
+    RL --> S1["model.sample() 自回歸取樣"]
+    RL --> S2["_score_batch()\n合法性 -> filter_api -> inference_api -> pareto"]
+    S2 --> SF
+    S2 --> PIA
+    S2 --> PARETO["pareto.assign_pareto_fronts()"]
+    RL --> S3["REINFORCE + baseline\n(_sequence_log_prob 對 prior_model 做正則化)"]
+    RL --> S4["_update_dynamic_pool()\n同步進 DynamicSmilesLMDataset"]
+    S4 -.->|"下個 epoch 監督式訓練會用到"| DS
+
+    subgraph INFER["推論階段（訓練結束後，獨立呼叫）"]
+        GEN["MoleculeGenerator(tokenizer_path, config_path, checkpoint_path)"]
+        GEN --> G1["sample()"]
+        GEN --> G2["sample_from_prefix()"]
+        GEN --> G3["generate_analogs()"]
+        G1 --> MODEL2["SmilesLM.sample()"]
+        G2 --> MODEL3["SmilesLM.generate_from_prefix()"]
+        G3 --> G2
+        G3 -->|"選填"| SF
+        G3 -->|"選填"| PIA
+        G3 -->|"選填"| PARETO
+    end
+```
+
+### 2. 靜態物件關係（Class Diagram）
+
+```mermaid
+classDiagram
+    class SmilesTokenizer {
+        +tokenize(smiles) List
+        +encode(smiles) List~int~
+        +decode(indices) str
+        +build_vocab(smiles_list)
+        +save(filepath) / load(filepath)
+        +vocab_size / start_idx / end_idx / pad_idx
+    }
+
+    class sample_next_token {
+        <<function>>
+        greedy 或 multinomial 取樣
+    }
+
+    class SmilesLM {
+        <<nn.Module>>
+        +embedding : nn.Embedding
+        +gru : nn.GRU
+        +fc_out : nn.Linear
+        +forward(input_tokens, hidden) logits, hidden
+        +sample(num_samples, max_length, start_idx, device) tokens
+        +generate_from_prefix(prefix_tokens, max_length) tokens
+    }
+    SmilesLM ..> sample_next_token : 每步取樣呼叫
+
+    class SmilesLMDataset {
+        <<Dataset>>
+        +smiles_list : List~str~
+        +randomize : bool
+        __getitem__(idx) str
+    }
+
+    class DynamicSmilesLMDataset {
+        <<Dataset>>
+        +base_smiles : List~str~
+        +dynamic_smiles : List~str~
+        +randomize : bool
+        +set_dynamic_smiles(smiles_list)
+        __getitem__(idx) str
+    }
+
+    class PropertySpec {
+        +goal : str
+        +low / high : float
+        +to_objective(value) float
+    }
+
+    class StructureFilter {
+        +forbidden_patterns
+        +desired_patterns
+        __call__(smiles_list) List~str~
+    }
+
+    class PropertyInferenceAPI {
+        +register_property(name, func)
+        +inference_pipeline(smiles_list, properties) DataFrame
+    }
+
+    class assign_pareto_fronts {
+        <<function>>
+        non-dominated sorting -> front_ranks
+    }
+    PropertySpec ..> assign_pareto_fronts : to_objective() 結果被拿去排序
+
+    class Trainer {
+        +model : SmilesLM
+        +tokenizer : SmilesTokenizer
+        +train_loader / val_loader : DataLoader
+        +optimizer : Adam
+        +train_epoch(epoch) dict
+        +validate(epoch) dict
+        +train(num_epochs)
+        +save_checkpoint(epoch, filename)
+    }
+    Trainer *-- SmilesLM : model
+    Trainer *-- SmilesTokenizer : tokenizer
+    Trainer o-- SmilesLMDataset : train_loader.dataset
+
+    class PropertyGuidedLMTrainer {
+        +filter_api : Callable
+        +inference_api : PropertyInferenceAPI
+        +target_spec : Dict~PropertySpec~
+        +prior_model : SmilesLM
+        +dynamic_pool : Dict
+        +_snapshot_prior()
+        +_generation_mask(tokens) mask
+        +_sequence_log_prob(model, tokens, mask) logp
+        +_score_batch(smiles_list) rewards
+        +run_rl_round(epoch, round_idx) metrics
+        +train(num_epochs)
+    }
+    PropertyGuidedLMTrainer --|> Trainer : 繼承（複用 train_epoch/validate/save_checkpoint）
+    PropertyGuidedLMTrainer o-- StructureFilter : filter_api
+    PropertyGuidedLMTrainer *-- PropertyInferenceAPI : inference_api
+    PropertyGuidedLMTrainer o-- PropertySpec : target_spec
+    PropertyGuidedLMTrainer ..> assign_pareto_fronts : _score_batch() 內呼叫
+    PropertyGuidedLMTrainer o-- SmilesLM : prior_model（凍結 snapshot）
+    PropertyGuidedLMTrainer o-- DynamicSmilesLMDataset : train_loader.dataset (set_dynamic_smiles)
+
+    class MoleculeGenerator {
+        +tokenizer : SmilesTokenizer
+        +model : SmilesLM
+        +max_length : int
+        +sample(num_samples) List~str~
+        +sample_from_prefix(smiles, num_samples) List
+        +generate_analogs(smiles, num_candidates, ...) DataFrame
+    }
+    MoleculeGenerator *-- SmilesLM : model
+    MoleculeGenerator *-- SmilesTokenizer : tokenizer
+    MoleculeGenerator ..> StructureFilter : filter_api（呼叫端傳入，選填）
+    MoleculeGenerator ..> PropertyInferenceAPI : inference_api（呼叫端傳入，選填）
+    MoleculeGenerator ..> assign_pareto_fronts : generate_analogs() 內呼叫
+```
+
+### 怎麼讀這兩張圖
+
+- **虛線箭頭 (`..>`)**：呼叫/使用某個函式或選填的外部依賴（例如 `MoleculeGenerator` 的
+  `filter_api`/`inference_api` 是呼叫端自己傳進來的，`MoleculeGenerator` 本身不擁有它們）。
+- **實心菱形 (`*--`)**：強擁有關係（例如 `Trainer.model` 是這個 `Trainer` 建構時就固定
+  持有的 `SmilesLM` 實例）。
+- **空心菱形 (`o--`)**：較鬆散的持有關係（例如 `train_loader.dataset` 是透過 `DataLoader`
+  間接持有，`PropertyGuidedLMTrainer.prior_model` 是訓練過程中才由 `_snapshot_prior()`
+  賦值，一開始是 `None`）。
+- **`--|>`**：繼承。`PropertyGuidedLMTrainer` 是 `Trainer` 的子類別，這也是為什麼它可以
+  直接複用 `train_epoch`/`validate`/`save_checkpoint`，只需要在 `train()` 裡插入 RL 回合。
+- **`tokenizer.py`/`filters.py`/`properties.py`/`pareto.py`/`models/sampling.py`** 這幾個
+  最底層的模組完全沒有畫「依賴別人」的箭頭——它們是整個依賴圖的葉節點，`training.py`/
+  `rl_trainer.py`/`generation.py` 這三個「組裝層」都依賴它們，但反過來不成立，這也是它們
+  可以被 `gruvae`/`reinvent_lm` 兩邊各自獨立複製一份、互不影響的原因。
+- `training.py` 跟 `generation.py` 是兩個**平行、互不依賴**的入口——訓練完全不需要
+  `MoleculeGenerator`，推論也完全不需要 `Trainer`，兩者只透過磁碟上的 `.pt` + `config.yaml`
+  + `tokenizer.json` 三份檔案間接銜接（見 [Checkpoint 格式](#checkpoint-格式)）。
 
 ---
 
@@ -252,6 +445,7 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 | `num_samples_per_round` | 256 | 每個 RL round 取樣幾個分子來算 reward、更新一次模型 |
 | `num_rl_rounds_per_epoch` | 1 | 每個 epoch（做完監督式訓練後）跑幾個 RL round |
 | `warmup_epochs` | 5 | 前幾個 epoch 只做監督式訓練（不啟動 RL），讓模型先把基本語法學好；warmup 結束那一刻（`epoch == warmup_epochs + 1`）會把當時的模型 snapshot 下來當作 RL 的 **prior**（之後永遠不會再更新，見下節說明） |
+| `supervised_training_during_rl` | true | warmup 結束、RL 開始之後，是否每個 epoch 仍要做一次監督式訓練（`train_epoch`）。設 `false` 時 warmup 結束後只靠 RL（`loss_pg` + prior 正則化）更新模型，不再穿插監督式訓練，跟 REINVENT 原版 Agent 微調階段的做法一致；不影響 warmup 期間（warmup 本身就是監督式訓練）。設 `false` 時動態訓練池仍會照常累積，但不會再被拿去訓練，可視情況一併關掉 `dynamic_training_data.enabled` |
 | `reward_invalid` | -1.0 | RDKit 無法解析的分子的 reward |
 | `reward_structure_fail` | -0.5 | 合法但沒通過 `structure_filter` 的分子的 reward |
 | `reward_pass_base` | 0.0 | 通過結構檢查、但 pareto front 排名最差的分子的 reward |
@@ -281,7 +475,15 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 
 `PropertyGuidedLMTrainer`（`rl_trainer.py`）繼承 `Trainer`，複用預訓練的
 `train_epoch`/`validate`/`save_checkpoint`，只在 `train()` 的 epoch 迴圈中，
-warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更新回合。
+warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更新回合。warmup 期間
+（`epoch <= warmup_epochs`）一定會做監督式訓練；warmup 結束後預設仍會繼續做監督式訓練，
+但可以用 `supervised_training_during_rl: false` 關掉，讓 RL 開始之後完全只靠
+`loss_pg` + prior 正則化更新模型（跟 REINVENT 原版 Agent 微調階段一致）——這麼做的理由是：
+`prior_kl_weight` 正則化本身已經承擔了「別離原始化學空間太遠」的角色，跟監督式訓練
+防止 mode collapse 的功能有重疊，兩者同時對模型施力方向不一定一致，關掉監督式訓練
+可以讓 RL 的梯度訊號更乾淨、不被稀釋，但也少了監督式訓練「拉回」多樣性的效果，
+建議搭配追蹤生成分子的多樣性（而不只是 `mean_reward`/`pass_filter`）來判斷是否適合
+你的情境。
 
 ### 一個 RL round 的完整流程（`run_rl_round`）
 
@@ -363,16 +565,16 @@ generator = MoleculeGenerator(
 )
 ```
 
-（也支援直接傳入已經存在的 `model`/`tokenizer`/`max_length` 三個參數，這個模式是給
-`Trainer` 內部在訓練過程中即時測試用的，一般使用建議用上面「從檢查點載入」的方式。）
+（也支援直接傳入已經存在的 `model`/`tokenizer`/`max_length` 三個參數，適合模型已經在
+記憶體中、不想重新從磁碟載入權重的情境；一般使用建議用上面「從檢查點載入」的方式。）
 
-### `sample(num_samples, sampling_mode='multinomial', temperature=1.0) -> List[str]`
+### `sample(num_samples, sampling_mode='multinomial', temperature=1.0, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> List[str]`
 
 從 `<START>` 開始隨機生成 `num_samples` 個全新分子。`sampling_mode` 可以是
 `'multinomial'`（依機率分布抽樣，有多樣性）或 `'greedy'`（每步都選機率最大的 token，
 結果是確定性的，多次呼叫會拿到一樣的分子）。
 
-### `sample_from_prefix(smiles, num_samples, truncate_fraction=None, truncate_fraction_range=(0.3, 0.7), randomize_input=True, sampling_mode='multinomial', temperature=1.0) -> List[str] | List[List[str]]`
+### `sample_from_prefix(smiles, num_samples, truncate_fraction=None, truncate_fraction_range=(0.3, 0.7), randomize_input=True, sampling_mode='multinomial', temperature=1.0, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> List[str] | List[List[str]]`
 
 因為這個架構**沒有連續潛在空間**，沒辦法像 VAE 那樣「編碼成 z、加點雜訊、解碼回來」做
 鄰近探索。這裡改用**截斷種子分子的 token 序列、讓模型接續自回歸生成剩下的部分**：
@@ -401,7 +603,7 @@ token 序列，長度可能都不一樣（不同隨機書寫法的 token 數不�
 長度分組，同一組內長度一致才一起 batch 做 teacher forcing，避免長度不同時得靠 padding
 湊齊、進而汙染 hidden state 的問題。
 
-### `generate_analogs(smiles, num_candidates=100, ..., randomize_input=True, filter_api=None, inference_api=None, target_spec=None, dedupe=True, top_k=None) -> pd.DataFrame`
+### `generate_analogs(smiles, num_candidates=100, ..., randomize_input=True, filter_api=None, inference_api=None, target_spec=None, dedupe=True, top_k=None, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> pd.DataFrame`
 
 把 `sample_from_prefix` 取樣、去重複/去無效、`filter_api` 結構過濾、
 `inference_api` + `target_spec` 的 pareto front 排序串起來，一次做完「找一個（或一批）
@@ -433,6 +635,31 @@ df = generator.generate_analogs(
 從哪個輸入種子生成的，需要的話可以自行 `df.groupby('seed')` 拆開看；`dedupe=True` 時
 會排除跟**任一個**輸入種子相同的候選。`filter_api`/`inference_api` 不填的話就不做結構
 過濾/性質排序，只回傳去重複、去無效之後的候選分子。
+
+### 顯示分子結構圖（`display_molecules`）
+
+`sample`/`sample_from_prefix`/`generate_analogs` 三個函式都支援
+`display_molecules=True`，會額外把這次生成/篩選出來的分子畫成結構網格圖：
+每列 `mols_per_row`（預設 10）個，每張圖最多 `max_mols_per_image`（預設 100）個，
+超過會自動切成多張圖依序顯示。`generate_analogs` 有給 `target_spec` 時，legend
+會標上 `front=<front_rank>` 方便一眼看出排序好壞；`sample_from_prefix` 給一個
+SMILES list 時，legend 會標上 `[seed i]` 標記每個鄰近分子來自哪個種子。
+
+```python
+generator.sample(20, display_molecules=True, mols_per_row=5)
+```
+
+**只有在真的於 Jupyter/IPython kernel 裡執行時才會內嵌顯示圖片**（用
+`'ipykernel' in sys.modules` 判斷）；在一般的 python 腳本裡呼叫，會改成把每一頁
+存成一個 `.svg` 檔案（存在系統暫存目錄，路徑會印出來），需要自己另外打開看。
+這是刻意的設計，不是偷懶：這台開發機的環境下，只要在呼叫過 RDKit 的
+`Chem`/`Draw` 之後才第一次 `import IPython`，就算完全不呼叫 `display()`，
+process 也會直接 segfault（已確認是環境層級的 shared library 衝突，不是
+邏輯錯誤）；用 `sys.modules` 判斷完全不會觸發新的 IPython import——真的在
+notebook 裡執行時，`ipykernel` 這個模組本來就已經被 kernel process 自己載入過了，
+這時候用它是安全的。畫圖也一律用 `useSVG=True`（而不是 RDKit 預設的 raster/PNG
+模式），因為部分環境下 raster 模式搭配 legend 文字一樣會讓 FreeType 字型渲染
+segfault。
 
 ---
 

@@ -4,6 +4,7 @@ SmilesLM 分子生成器
 """
 
 import os
+import tempfile
 from typing import Dict, List, Optional, Union
 
 import yaml
@@ -103,13 +104,94 @@ class MoleculeGenerator:
                 "  2. tokenizer_path + config_path + checkpoint_path (從檢查點獨立載入)"
             )
 
+    def _display_molecule_grid(
+        self,
+        smiles_list: List[str],
+        legends: Optional[List[str]] = None,
+        mols_per_row: int = 10,
+        max_mols_per_image: int = 100,
+    ) -> None:
+        """
+        把一批 SMILES 畫成分子結構網格圖顯示，每列 mols_per_row 個，每張圖最多
+        max_mols_per_image 個，超過會自動切成多張圖依序顯示。
+
+        用 useSVG=True 渲染，而不是 RDKit 預設的 raster (PNG) 模式：部分環境下用
+        raster 模式畫 legend 文字時，底層 FreeType 字型渲染會直接讓 process segfault
+        （這是 RDKit 在特定環境下的已知問題，不是這裡的邏輯錯誤），SVG 渲染完全不會
+        走到那段文字光柵化的路徑，穩定很多，在 Jupyter 裡也能直接內嵌顯示。
+
+        是否呼叫 IPython 的 display()：只在**確定已經有一個活著的 Jupyter kernel 在跑**時才用，
+        用 `'ipykernel' in sys.modules` 判斷，而不是自己動手 `import IPython`。這裡刻意不自己
+        匯入 IPython——在這台機器的環境下，即使只是單純 `from IPython import get_ipython`，
+        只要在那之前已經呼叫過 RDKit 的 `Chem`/`Draw`，就會讓 process 直接 segfault
+        （確認過是環境層級的 shared library 衝突，重現穩定但跟這裡的程式邏輯無關）。
+        用 `sys.modules` 判斷完全不會觸發新的 import：真的在 Jupyter kernel 裡執行時，
+        `ipykernel` 一定早就被 kernel 本身載入好了，這時候 `import IPython.display`
+        只是查 cache，不會重新載入任何東西，所以是安全的；不在 kernel 裡執行時，
+        就完全不去碰 IPython，一律存成 SVG 檔案。
+        """
+        import sys
+        from rdkit.Chem import Draw
+
+        if legends is None:
+            legends = list(smiles_list)
+        elif len(legends) != len(smiles_list):
+            raise ValueError("legends 長度必須跟 smiles_list 一致")
+
+        valid_entries = [
+            (mol, legend)
+            for smiles, legend in zip(smiles_list, legends)
+            for mol in [Chem.MolFromSmiles(smiles)]
+            if mol is not None
+        ]
+        num_invalid = len(smiles_list) - len(valid_entries)
+        if num_invalid > 0:
+            print(f"（{num_invalid} 個無效分子已略過，不會顯示在圖片中）")
+        if not valid_entries:
+            print("沒有可顯示的合法分子")
+            return
+
+        display = None
+        SVG = None
+        if 'ipykernel' in sys.modules:
+            from IPython.display import display, SVG
+
+        for page, start in enumerate(range(0, len(valid_entries), max_mols_per_image), start=1):
+            chunk = valid_entries[start:start + max_mols_per_image]
+            svg = Draw.MolsToGridImage(
+                [mol for mol, _ in chunk],
+                molsPerRow=mols_per_row,
+                subImgSize=(200, 200),
+                legends=[legend for _, legend in chunk],
+                useSVG=True,
+            )
+            # RDKit 自己也會偵測是否在 IPython/notebook 環境下：偵測到的話
+            # MolsToGridImage 會直接回傳一個包好的 IPython.display.SVG 物件，
+            # 不是純文字；偵測不到才會回傳原始 SVG 字串。用型別判斷兩種情況，
+            # 不要對已經是 SVG 物件的結果再包一層 SVG(...)（會直接壞掉）。
+            if display is not None:
+                display(svg if not isinstance(svg, str) else SVG(svg))
+            else:
+                svg_text = svg if isinstance(svg, str) else getattr(svg, 'data', str(svg))
+                fd, path = tempfile.mkstemp(prefix=f'molecules_page{page}_', suffix='.svg')
+                with os.fdopen(fd, 'w') as f:
+                    f.write(svg_text)
+                print(f"（非 Jupyter 環境，已將第 {page} 張分子結構圖存成 SVG: {path}）")
+
     def sample(
         self,
         num_samples: int,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        display_molecules: bool = False,
+        mols_per_row: int = 10,
+        max_mols_per_image: int = 100,
     ) -> List[str]:
-        """從 BOS token 開始隨機採樣生成分子"""
+        """從 BOS token 開始隨機採樣生成分子
+
+        display_molecules=True 時會額外畫出分子結構網格圖（每列 mols_per_row 個，
+        每張圖最多 max_mols_per_image 個，超過自動分頁）。
+        """
         self.model.eval()
         with torch.no_grad():
             tokens = self.model.sample(
@@ -120,7 +202,14 @@ class MoleculeGenerator:
                 sampling_mode=sampling_mode,
                 temperature=temperature,
             )
-        return [self.tokenizer.decode(tokens[i].cpu().tolist()) for i in range(num_samples)]
+        smiles_list = [self.tokenizer.decode(tokens[i].cpu().tolist()) for i in range(num_samples)]
+
+        if display_molecules:
+            self._display_molecule_grid(
+                smiles_list, mols_per_row=mols_per_row, max_mols_per_image=max_mols_per_image
+            )
+
+        return smiles_list
 
     def sample_from_prefix(
         self,
@@ -131,6 +220,9 @@ class MoleculeGenerator:
         randomize_input: bool = True,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        display_molecules: bool = False,
+        mols_per_row: int = 10,
+        max_mols_per_image: int = 100,
     ) -> Union[List[str], List[List[str]]]:
         """
         把種子分子的 SMILES 截斷到某個比例當 prefix，讓模型接續自回歸生成剩下的部分，
@@ -150,6 +242,11 @@ class MoleculeGenerator:
                 （每個樣本各自獨立抽一次新的隨機表示法，不是整批共用同一個）
             sampling_mode: 'greedy' 或 'multinomial'
             temperature: multinomial 模式下的取樣溫度
+            display_molecules: True 時額外畫出分子結構網格圖（每列 mols_per_row 個，
+                每張圖最多 max_mols_per_image 個，超過自動分頁）。smiles 為 list 時，
+                所有種子的鄰近分子會畫在同一組圖裡，legend 會標上 `[seed i]` 方便分辨
+                來自哪個種子
+            mols_per_row / max_mols_per_image: 見 display_molecules
 
         Returns:
             smiles 為單一字串時：List[str]（長度 num_samples）
@@ -208,6 +305,21 @@ class MoleculeGenerator:
         for i, seed_idx in enumerate(owner):
             grouped[seed_idx].append(results_flat[i])
 
+        if display_molecules:
+            if single_input:
+                self._display_molecule_grid(
+                    grouped[0], mols_per_row=mols_per_row, max_mols_per_image=max_mols_per_image
+                )
+            else:
+                flat_smiles = [s for group in grouped for s in group]
+                flat_legends = [
+                    f"[seed {seed_idx}] {s}" for seed_idx, group in enumerate(grouped) for s in group
+                ]
+                self._display_molecule_grid(
+                    flat_smiles, legends=flat_legends,
+                    mols_per_row=mols_per_row, max_mols_per_image=max_mols_per_image,
+                )
+
         return grouped[0] if single_input else grouped
 
     def generate_analogs(
@@ -224,6 +336,9 @@ class MoleculeGenerator:
         target_spec: Optional[Dict[str, PropertySpec]] = None,
         dedupe: bool = True,
         top_k: Optional[int] = None,
+        display_molecules: bool = False,
+        mols_per_row: int = 10,
+        max_mols_per_image: int = 100,
     ) -> pd.DataFrame:
         """
         針對一個（或一批）種子分子做「鄰近結構搜索」：用 sample_from_prefix 在附近取樣候選
@@ -246,6 +361,10 @@ class MoleculeGenerator:
             target_spec: {性質名稱: PropertySpec}，用來做 pareto front 排序；不填則不排序
             dedupe: 是否對候選分子做 canonical 去重複，並排除跟任一個輸入種子分子相同的結果
             top_k: 只回傳排序後前 k 筆 (需搭配 target_spec)
+            display_molecules: True 時額外畫出最終結果的分子結構網格圖（每列 mols_per_row
+                個，每張圖最多 max_mols_per_image 個，超過自動分頁）。有 target_spec 時
+                legend 會標上 `front=<front_rank>`，方便一眼看出排序好壞
+            mols_per_row / max_mols_per_image: 見 display_molecules
 
         Returns:
             DataFrame，欄位為 ['smiles', 'seed']，有給 target_spec 時額外附上各性質欄位與 'front_rank'
@@ -290,27 +409,40 @@ class MoleculeGenerator:
             candidate_seeds = [candidate_seeds[i] for i in keep]
 
         if not candidate_smiles:
-            return pd.DataFrame(columns=['smiles', 'seed'])
+            result_df = pd.DataFrame(columns=['smiles', 'seed'])
+        elif target_spec is None:
+            result_df = pd.DataFrame({'smiles': candidate_smiles, 'seed': candidate_seeds})
+        else:
+            if inference_api is None:
+                raise ValueError("提供 target_spec 時必須同時提供 inference_api")
 
-        if target_spec is None:
-            return pd.DataFrame({'smiles': candidate_smiles, 'seed': candidate_seeds})
+            prop_df = inference_api.inference_pipeline(candidate_smiles, properties=list(target_spec.keys()))
+            prop_df.insert(1, 'seed', candidate_seeds)
+            objective_matrix = np.array([
+                [target_spec[prop].to_objective(row[prop]) for prop in target_spec]
+                for _, row in prop_df.iterrows()
+            ])
+            prop_df['front_rank'] = assign_pareto_fronts(objective_matrix)
+            prop_df = prop_df.sort_values('front_rank').reset_index(drop=True)
 
-        if inference_api is None:
-            raise ValueError("提供 target_spec 時必須同時提供 inference_api")
+            if top_k is not None:
+                prop_df = prop_df.head(top_k)
 
-        prop_df = inference_api.inference_pipeline(candidate_smiles, properties=list(target_spec.keys()))
-        prop_df.insert(1, 'seed', candidate_seeds)
-        objective_matrix = np.array([
-            [target_spec[prop].to_objective(row[prop]) for prop in target_spec]
-            for _, row in prop_df.iterrows()
-        ])
-        prop_df['front_rank'] = assign_pareto_fronts(objective_matrix)
-        prop_df = prop_df.sort_values('front_rank').reset_index(drop=True)
+            result_df = prop_df
 
-        if top_k is not None:
-            prop_df = prop_df.head(top_k)
+        if display_molecules and len(result_df) > 0:
+            if 'front_rank' in result_df.columns:
+                legends = [
+                    f"front={rank}  {s}" for rank, s in zip(result_df['front_rank'], result_df['smiles'])
+                ]
+            else:
+                legends = result_df['smiles'].tolist()
+            self._display_molecule_grid(
+                result_df['smiles'].tolist(), legends=legends,
+                mols_per_row=mols_per_row, max_mols_per_image=max_mols_per_image,
+            )
 
-        return prop_df
+        return result_df
 
 
 def test_generator():

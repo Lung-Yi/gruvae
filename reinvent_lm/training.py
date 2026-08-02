@@ -411,4 +411,5 @@ def build_property_guided_trainer(common_trainer_kwargs: dict, pg_config: dict, 
         dynamic_pool_enabled=dynamic_pool_config.get('enabled', True),
         dynamic_pool_max_size=dynamic_pool_config.get('max_pool_size', 500),
         front1_log_path=pg_config.get('front1_log_path'),
+        supervised_training_during_rl=pg_config.get('supervised_training_during_rl', True),
     )

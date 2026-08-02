@@ -65,6 +65,7 @@ class PropertyGuidedLMTrainer(Trainer):
         dynamic_pool_enabled: bool = True,
         dynamic_pool_max_size: int = 500,
         front1_log_path: Optional[str] = None,
+        supervised_training_during_rl: bool = True,
         **kwargs
     ):
         """
@@ -88,8 +89,17 @@ class PropertyGuidedLMTrainer(Trainer):
             dynamic_pool_enabled: 是否把合規分子動態加入/淘汰進訓練資料
             dynamic_pool_max_size: 動態訓練池最多保留幾個分子（用全池 pareto front 排序淘汰）
             front1_log_path: front 1 分子的 CSV log 路徑，預設存在 save_dir 底下
+            supervised_training_during_rl: warmup 結束、RL 開始之後，是否每個 epoch 仍要
+                做一次監督式訓練（train_epoch）。預設 True 維持原本行為；設 False 時，
+                warmup 結束後就只靠 RL（loss_pg + prior 正則化）更新模型，不再穿插監督式
+                訓練——這跟 REINVENT 原版（Olivecrona et al. 2017）Agent 微調階段的做法一致。
+                注意：warmup 期間（epoch <= warmup_epochs）不受這個參數影響，一定會做監督式
+                訓練，因為這正是 warmup 存在的目的。設 False 時，動態訓練池仍會照常累積/淘汰，
+                但不再被拿去訓練模型（因為監督式訓練被跳過了），如果不需要它可以考慮同時把
+                dynamic_pool_enabled 設 False 省一點計算。
         """
         super().__init__(*args, **kwargs)
+        self.supervised_training_during_rl = supervised_training_during_rl
 
         self.filter_api = filter_api
         self.inference_api = inference_api
@@ -351,6 +361,8 @@ class PropertyGuidedLMTrainer(Trainer):
         print(f"訓練集大小: {len(self.train_loader.dataset)}（含動態訓練池: {self.dynamic_pool_enabled}）")
         print(f"驗證集大小: {len(self.val_loader.dataset)}")
         print(f"設備: {self.device}")
+        if not self.supervised_training_during_rl:
+            print("注意: supervised_training_during_rl=False，warmup 結束後將只靠 RL 更新模型")
         print(f"Front 1 log: {self.front1_log_path}\n")
 
         best_val_loss = float('inf')
@@ -358,8 +370,16 @@ class PropertyGuidedLMTrainer(Trainer):
         for epoch in range(1, num_epochs + 1):
             current_lr = self.optimizer.param_groups[0]['lr']
 
-            train_metrics = self.train_epoch(epoch)
-            self.history['train_loss'].append(train_metrics['loss'])
+            # warmup 期間一定要做監督式訓練（這正是 warmup 存在的目的）；
+            # warmup 結束、RL 開始之後，是否繼續做監督式訓練由 supervised_training_during_rl 決定
+            run_supervised = self.supervised_training_during_rl or epoch <= self.warmup_epochs
+            if run_supervised:
+                train_metrics = self.train_epoch(epoch)
+                train_loss_str = f"{train_metrics['loss']:.4f}"
+                self.history['train_loss'].append(train_metrics['loss'])
+            else:
+                train_loss_str = "skipped (supervised_training_during_rl=False)"
+                self.history['train_loss'].append(None)
 
             val_metrics = self.validate(epoch)
             self.history['val_loss'].append(val_metrics['loss'])
@@ -371,7 +391,7 @@ class PropertyGuidedLMTrainer(Trainer):
             print(f"Epoch {epoch} Summary:")
             print(f"{'='*80}")
             print(f"  訓練資料筆數（含動態池）: {len(self.train_loader.dataset)}")
-            print(f"  Train Loss: {train_metrics['loss']:.4f}")
+            print(f"  Train Loss: {train_loss_str}")
             print(f"  Val Loss:   {val_metrics['loss']:.4f}, Perplexity: {val_metrics['perplexity']:.4f}")
             print(f"  Sample Validity Rate: {val_metrics['validity_rate']:.2%}")
 
