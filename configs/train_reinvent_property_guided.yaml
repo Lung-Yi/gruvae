@@ -1,0 +1,155 @@
+# REINVENT 風格 GRU decoder-only 語言模型 Property-Guided RL 訓練配置檔案
+# 用法: python train_reinvent.py --config configs/train_reinvent_property_guided.yaml
+#
+# 開啟 property_guided.enabled 後：
+#   1. 訓練資料在一開始就會先用 filter_api 過濾過，只保留符合結構規則的 SMILES
+#   2. warmup 結束後每個 epoch 會額外用目前的模型採樣一批分子（從 BOS 開始自回歸生成），
+#      依「結構規則(filter_api)」+「性質目標(target_spec) 的 pareto front 排序」算 reward，
+#      做 REINFORCE 微調
+#   3. 通過結構規則的分子會被拿去更新一個動態訓練池，直接同步進實際的訓練資料
+#   4. 每一輪 front 1（最好的一層）的分子結構與性質會寫進 property_guided.front1_log_path
+
+# 資料設定
+data:
+  train_csv: './data/processed/train_small_processed.csv'
+  train_split: 0.9
+  max_length: 50
+  # 訓練時是否每次取用都用 RDKit 重新隨機化 SMILES 書寫法 (SMILES enumeration)，
+  # 對監督式訓練那部分的資料（含動態訓練池）有效；驗證集固定用 canonical 寫法
+  randomize_smiles: true
+
+# 模型架構
+model:
+  embedding_dim: 256
+  hidden_dim: 512
+  num_layers: 3
+  dropout: 0.1
+
+# 訓練參數
+training:
+  num_epochs: 100
+  batch_size: 128
+  learning_rate: 0.001
+  num_workers: 0
+  grad_clip_max_norm: 1.0
+
+# 驗證設定
+validation:
+  num_sample: 10
+
+# 檢查點設定
+checkpoint:
+  save_dir: './checkpoints/reinvent_property_guided'
+  save_interval: 5
+  load_from: './checkpoints/reinvent_small/best_model.pt'   # 從預訓練好的 SmilesLM 開始做 RL 微調
+
+# 設備設定
+device:
+  use_cuda: true
+
+# 隨機種子
+seed: 42
+
+# ------------------------------------------------------------------
+# Property-Guided RL 訓練設定
+# ------------------------------------------------------------------
+property_guided:
+  enabled: true
+
+  max_length: 50
+
+  num_samples_per_round: 1024
+  num_rl_rounds_per_epoch: 2
+
+  # 前幾個 epoch 只做原本的監督式訓練，之後才開始 RL 微調
+  warmup_epochs: 10
+
+  # warmup 結束、RL 開始之後，是否每個 epoch 仍要做一次監督式訓練（train_epoch）。
+  # true（預設）：跟原本行為一樣，監督式訓練 + RL 同時進行。
+  # false：warmup 結束後只靠 RL（loss_pg + prior 正則化）更新模型，不再穿插監督式訓練，
+  #        跟 REINVENT 原版 Agent 微調階段的做法一致。這個設定不影響 warmup 期間
+  #        （warmup 本身就是監督式訓練）。設 false 時動態訓練池仍會照常累積，
+  #        但不會再被拿去訓練，可視情況一併關掉 dynamic_training_data.enabled。
+  supervised_training_during_rl: true
+
+  # 菁英 archive 保留 pareto rank 0 ~ (elite_archive_rank-1)（前幾層）的「所有」分子，
+  # 不是保留固定數量——同一層裡不管有幾個分子都會全部留著。這是一個獨立於
+  # dynamic_training_data 的小型 buffer，只用來當 reward 的比較基準（不會被拿去訓練
+  # 模型）。每輪算 reward 時，會把通過結構檢查的分子跟 archive 目前保留的分子合併做
+  # 一次 pareto front 排序，用「相對於歷史最佳前緣」的名次算 reward，而不是只跟同一輪
+  # 隨機抽到的分子比較——避免 reward 尺度因為每輪抽樣組成不同而忽大忽小。這個數字也
+  # 同時當作 reward 名次縮放的分母上限：名次超過 elite_archive_rank 的分子一律視為
+  # 「跟 archive 最差成員打平」，只拿 reward_pass_base；數字越小，前段班分子彼此的
+  # reward 差異會被放大越多，數字越大則相反（但能容納更細的名次分佈）。archive 每個
+  # RL round 結束後都會依 rank 重新篩選一次。
+  # 注意：因為是依 rank 篩選、不是依數量，如果同一個 rank 內同時有很多分子打平
+  # （例如多個 range 型性質都達標、都落在同一個最低目標值），archive 可能會持續
+  # 成長沒有上限，訓練時建議留意 elite_archive_size（archive 目前實際分子數）這個 log 欄位。
+  elite_archive_rank: 5
+
+  # reward 名次縮放曲線的指數：scale = (1 - rank/(elite_archive_rank-1)) ** reward_scale_power。
+  # 預設 1.0 是線性，每往後一階名次的 reward 差距固定（例如 elite_archive_rank=20 時每階
+  # 只差全部 reward 範圍的 ~5.3%）。調大這個值（例如 2、3）會讓曲線變凹，前幾名之間的 reward
+  # 差距被放大、後段名次彼此更接近（但仍平滑遞減到 reward_pass_base，不會斷崖式歸零）。
+  # 觀察到前幾名 reward 差距太小、訊號不夠明顯時可以調大這個值。
+  reward_scale_power: 1.0
+
+  # 訓練後期 archive 穩定下來後，新採樣的分子很難再贏過/打平 archive，大部分分子的
+  # reward 會卡在同一個 reward_pass_base，梯度訊號接近消失。這裡設定「連續幾個
+  # epoch，archive 的第 archive_stagnation_watch_rank 層成員完全沒有變化」就視為停滯，
+  # 觸發一次清理：把 archive 清到只剩 rank < archive_prune_keep_rank 的分子（預設只留
+  # rank 0，歷史最佳前緣本身不受影響），讓中段名次重新空出來給後續採樣競爭。
+  # archive_stagnation_patience_epochs 預設 3：一個 epoch 內通常會跑好幾輪 RL round，
+  # 連續 3 個 epoch 完全沒有新分子擠進該層已經是不少次獨立嘗試都落空，算保守但不遲鈍
+  # 的訊號；實際跑起來如果清理太頻繁（reward 忽大忽小）可以調大，幾乎不觸發則可以調小。
+  # archive_stagnation_watch_rank 預設 1（rank 1，也就是「front 2」）而不是盯 rank 0：
+  # rank 0 是最難改善的一層，就算 archive 其他部分還在活躍競爭，rank 0 本身很可能好一
+  # 陣子都不會變（正常現象、不代表停滯），盯著次好的 rank 1 更能反映 archive 整體是否
+  # 還在往前動。
+  archive_stagnation_patience_epochs: 3
+  archive_stagnation_watch_rank: 1
+  archive_prune_keep_rank: 1
+
+  # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
+  reward_invalid: -2.0
+  reward_structure_fail: -1.0
+  reward_pass_base: 1.0
+  reward_pass_max: 2.0
+
+  # Prior regularization 權重，防止 RL 微調時生成多樣性崩潰 (mode collapse)
+  prior_kl_weight: 0.1
+
+  # multinomial 採樣溫度，越高越隨機/多樣，越低越接近 greedy
+  sampling_temperature: 1.0
+
+  # 結構規則過濾器 (filter_api) 的參數
+  structure_filter:
+    max_ring_size: 8
+    max_heavy_atoms: 60
+    min_heavy_atoms: 2
+    desired_smarts:
+      - "[#7]1~[#7]~[#6]~[#6]~[#6]1"
+    # require_all_desired: true
+
+  # 分子性質目標 (target_spec)
+  target_spec:
+    ClogP:
+      goal: range
+      low: 5.0
+      high: 6.5
+    SAScore:
+      goal: minimize
+
+  # 動態訓練資料：把「持續勝出」的合規分子直接同步進實際的訓練資料集
+  dynamic_training_data:
+    enabled: true
+    max_pool_size: 5000
+
+  # Front 1 分子的 CSV log 路徑，不填則預設存在 checkpoint.save_dir 底下的 front1_log.csv
+  front1_log_path: null
+
+  # 每一輪更新完 elite_archive 之後，archive 裡目前 pareto rank 前 5 層的分子
+  # （SMILES、各性質原始數值、rank）整批覆蓋寫進這份 CSV log（每次都覆蓋掉前一份，
+  # 只反映最新狀態，不留存歷史 epoch 紀錄），不填則預設存在 checkpoint.save_dir
+  # 底下的 elite_archive_log.csv
+  elite_archive_log_path: null

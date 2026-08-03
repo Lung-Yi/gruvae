@@ -7,10 +7,13 @@ import os
 import yaml
 import torch
 import numpy as np
-from typing import List, Tuple, Dict
+import pandas as pd
+from typing import List, Tuple, Dict, Optional
 from .tokenizer import SmilesTokenizer, canonicalize_smiles
 from .dataset import collate_fn, pad_to_len
 from .models.gru_vae import GRUVAE
+from .pareto import PropertySpec, assign_pareto_fronts
+from rdkit import Chem
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
@@ -19,11 +22,11 @@ class VAEMoleculeGenerator:
 
     def __init__(
         self,
-        tokenizer,
-        max_length: int,
+        tokenizer: Optional[SmilesTokenizer] = None,
+        max_length: Optional[int] = None,
         model=None,
-        config_path: str = None,
         tokenizer_path: str = None,
+        config_path: str = None,
         checkpoint_path: str = None,
         device: str = None
     ):
@@ -31,16 +34,17 @@ class VAEMoleculeGenerator:
         初始化 VAE 分子生成器
 
         支援兩種初始化模式:
-        1. 使用已有的模型實例 (用於訓練過程中)
-        2. 從檢查點載入 (用於獨立使用)
+        1. 使用已有的模型實例 (用於訓練過程中)：給 model + tokenizer + max_length
+        2. 從檢查點獨立載入 (方便在任何地方直接用)：只需給
+           tokenizer_path + config_path + checkpoint_path 三個路徑就好
 
         Args:
-            tokenizer: SmilesTokenizer 實例
-            max_length: 最大序列長度
+            tokenizer: SmilesTokenizer 實例 (模式1 用)
+            max_length: 最大序列長度 (模式1 用；模式2 會從 config 讀取)
             model: (可選) 已有的模型實例。如果提供,則不需要 config_path 和 checkpoint_path
-            config_path: (可選) 配置檔案路徑 (train.yaml)
-            tokenizer_path: (可選) tokenizer 檔案路徑 (tokenizer.json)
-            checkpoint_path: (可選) 模型檢查點路徑 (.pt)
+            tokenizer_path: tokenizer 檔案路徑 (tokenizer.json)，模式2 必填
+            config_path: 配置檔案路徑 (train.yaml)，模式2 必填
+            checkpoint_path: 模型檢查點路徑 (.pt)，模式2 必填
             device: 運算設備 ('cuda' 或 'cpu'，預設自動偵測)
         """
         # 設置設備
@@ -49,19 +53,21 @@ class VAEMoleculeGenerator:
         else:
             self.device = torch.device(device)
 
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
         # 模式1: 使用已有的模型實例
         if model is not None:
             print(f"使用已有的模型實例")
+            self.tokenizer = tokenizer
+            self.max_length = max_length
             self.model = model
             self.model.to(self.device)
             self.config = None
             print("✓ VAE 分子生成器初始化完成 (使用已有模型)!\n")
 
-        # 模式2: 從檢查點載入
+        # 模式2: 從檢查點獨立載入
         elif config_path is not None and checkpoint_path is not None:
+            if tokenizer_path is None:
+                raise ValueError("從檢查點載入時必須提供 tokenizer_path")
+
             print(f"使用設備: {self.device}")
 
             # 載入配置
@@ -69,11 +75,10 @@ class VAEMoleculeGenerator:
             with open(config_path, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f)
 
-            # 如果提供了 tokenizer_path，則重新載入 tokenizer
-            if tokenizer_path is not None:
-                print(f"載入 tokenizer: {tokenizer_path}")
-                self.tokenizer = SmilesTokenizer()
-                self.tokenizer.load(tokenizer_path)
+            # 載入 tokenizer
+            print(f"載入 tokenizer: {tokenizer_path}")
+            self.tokenizer = SmilesTokenizer()
+            self.tokenizer.load(tokenizer_path)
 
             # 建立模型
             print("建立模型...")
@@ -103,8 +108,8 @@ class VAEMoleculeGenerator:
         else:
             raise ValueError(
                 "必須提供以下其中一種:\n"
-                "  1. model (已有的模型實例)\n"
-                "  2. config_path + checkpoint_path (從檢查點載入)"
+                "  1. model + tokenizer + max_length (已有的模型實例)\n"
+                "  2. tokenizer_path + config_path + checkpoint_path (從檢查點獨立載入)"
             )
 
     def sample_molecules(self, num_samples: int) -> List[str]:
@@ -306,6 +311,125 @@ class VAEMoleculeGenerator:
 
         return latent_tensor
 
+    def sample_around(
+        self,
+        smiles: str,
+        num_samples: int,
+        noise_scale: float = 0.5,
+        sampling_mode: str = 'multinomial',
+        temperature: float = 1.0,
+    ) -> List[str]:
+        """
+        以某個分子在潛在空間的位置為中心，加高斯雜訊後解碼，探索附近的結構。
+
+        Args:
+            smiles: 種子分子的 SMILES
+            num_samples: 要生成幾個鄰近分子
+            noise_scale: 高斯雜訊的標準差，越大探索範圍越廣、跟原分子差異越大
+            sampling_mode: 'greedy' 或 'multinomial'（建議用 multinomial 才有多樣性，
+                不然雜訊還是一樣但每次都 argmax，很容易生出重複的分子）
+            temperature: multinomial 模式下的取樣溫度
+
+        Returns:
+            鄰近分子的 SMILES 列表 (長度為 num_samples，可能含重複/無效分子)
+        """
+        self.model.eval()
+        with torch.no_grad():
+            indices = self.tokenizer.encode(smiles, add_special_tokens=True)
+            tensor = pad_to_len(indices, self.max_length, self.tokenizer.pad_idx)
+            tensor = torch.tensor([tensor], dtype=torch.long).to(self.device)
+            mu, _ = self.model.encoder(tensor)  # [1, latent_dim]
+
+            z_center = mu.repeat(num_samples, 1)
+            z = z_center + torch.randn_like(z_center) * noise_scale
+
+            tokens = self.model.decoder.generate(
+                z, self.tokenizer.start_idx, self.max_length,
+                sampling_mode=sampling_mode, temperature=temperature
+            )
+
+        return [self.tokenizer.decode(tokens[i].cpu().tolist()) for i in range(num_samples)]
+
+    def generate_analogs(
+        self,
+        smiles: str,
+        num_candidates: int = 100,
+        noise_scale: float = 0.5,
+        sampling_mode: str = 'multinomial',
+        temperature: float = 1.0,
+        filter_api=None,
+        inference_api=None,
+        target_spec: Optional[Dict[str, PropertySpec]] = None,
+        dedupe: bool = True,
+        top_k: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        針對一個種子分子做「鄰近結構搜索」：在潛在空間附近取樣一批候選分子，
+        依序套用結構規則過濾 (filter_api) 與性質目標的 pareto front 排序 (target_spec)，
+        回傳排序後最好的候選分子。等於是把 RL 訓練用的 filter/pareto 機制搬來做
+        推論階段的應用：手上已經有一個分子，想找附近結構更好的替代品。
+
+        Args:
+            smiles: 種子分子的 SMILES
+            num_candidates: 潛在空間附近取樣的候選分子數量
+            noise_scale / sampling_mode / temperature: 同 sample_around
+            filter_api: 結構規則過濾器，簽名為 filter_api(smiles_list) -> List[str]；
+                不填則不做結構過濾
+            inference_api: 性質推論介面，需有 inference_pipeline(smiles_list, properties) -> DataFrame；
+                有提供 target_spec 時必填
+            target_spec: {性質名稱: PropertySpec}，用來做 pareto front 排序；
+                不填則不排序，只回傳過濾/去重後的候選
+            dedupe: 是否對候選分子做 canonical 去重複，並排除跟種子分子本身相同的結果
+            top_k: 只回傳排序後前 k 筆 (需搭配 target_spec)；不填則回傳全部
+
+        Returns:
+            DataFrame。欄位為 ['smiles']，有給 target_spec 時額外附上各性質欄位與
+            'front_rank'（越小代表越好，同一層 front 內不分優劣，順序依來源決定）
+        """
+        candidates = self.sample_around(
+            smiles, num_candidates,
+            noise_scale=noise_scale, sampling_mode=sampling_mode, temperature=temperature
+        )
+
+        valid_candidates = [s for s in candidates if Chem.MolFromSmiles(s) is not None]
+
+        if dedupe:
+            seed_canonical = canonicalize_smiles(smiles)
+            seen = set()
+            deduped = []
+            for s in valid_candidates:
+                canonical = canonicalize_smiles(s)
+                if canonical == seed_canonical or canonical in seen:
+                    continue
+                seen.add(canonical)
+                deduped.append(s)
+            valid_candidates = deduped
+
+        if filter_api is not None:
+            valid_candidates = filter_api(valid_candidates)
+
+        if not valid_candidates:
+            return pd.DataFrame(columns=['smiles'])
+
+        if target_spec is None:
+            return pd.DataFrame({'smiles': valid_candidates})
+
+        if inference_api is None:
+            raise ValueError("提供 target_spec 時必須同時提供 inference_api")
+
+        prop_df = inference_api.inference_pipeline(valid_candidates, properties=list(target_spec.keys()))
+        objective_matrix = np.array([
+            [target_spec[prop].to_objective(row[prop]) for prop in target_spec]
+            for _, row in prop_df.iterrows()
+        ])
+        prop_df['front_rank'] = assign_pareto_fronts(objective_matrix)
+        prop_df = prop_df.sort_values('front_rank').reset_index(drop=True)
+
+        if top_k is not None:
+            prop_df = prop_df.head(top_k)
+
+        return prop_df
+
 
 def test_generator():
     """測試 VAEMoleculeGenerator 的所有功能"""
@@ -313,16 +437,10 @@ def test_generator():
     print("開始測試 VAEMoleculeGenerator")
     print("="*80 + "\n")
 
-    # 載入 tokenizer
-    tokenizer = SmilesTokenizer()
-    tokenizer.load('./checkpoints/gru/tokenizer.json')
-
-    # 初始化生成器 (從檢查點載入模式)
+    # 初始化生成器 (從檢查點獨立載入模式，只需給三個路徑)
     generator = VAEMoleculeGenerator(
-        tokenizer=tokenizer,
-        max_length=128,
-        config_path='configs/train.yaml',
         tokenizer_path='./checkpoints/gru/tokenizer.json',
+        config_path='configs/train.yaml',
         checkpoint_path='./checkpoints/gru/checkpoint_epoch_20.pt'
     )
 
@@ -419,6 +537,41 @@ def test_generator():
     dist = torch.norm(latent_vectors[0] - latent_vectors[1]).item()
     print(f"  {encode_smiles[0]} <-> {encode_smiles[1]}")
     print(f"  距離: {dist:.4f}\n")
+
+    # 測試 5: 鄰近結構採樣
+    print("="*80)
+    print("測試 5: 鄰近結構採樣 (sample_around)")
+    print("="*80)
+    seed_smiles = "CCO"
+    neighbors = generator.sample_around(seed_smiles, num_samples=5, noise_scale=0.5)
+    print(f"  種子分子: {seed_smiles}")
+    print("  鄰近分子:")
+    for i, smiles in enumerate(neighbors, 1):
+        print(f"    [{i}] {smiles}")
+    print()
+
+    # 測試 6: 鄰近分子搜索 (結構過濾 + 性質 pareto 排序)
+    print("="*80)
+    print("測試 6: 鄰近分子搜索 (generate_analogs)")
+    print("="*80)
+    from .filters import StructureFilter
+    from .properties import PropertyInferenceAPI
+
+    analogs_df = generator.generate_analogs(
+        seed_smiles,
+        num_candidates=50,
+        noise_scale=0.5,
+        filter_api=StructureFilter(),
+        inference_api=PropertyInferenceAPI(),
+        target_spec={
+            "ClogP": PropertySpec(goal="range", low=1.0, high=3.0),
+            "SAScore": PropertySpec(goal="minimize"),
+        },
+        top_k=5,
+    )
+    print(f"  種子分子: {seed_smiles}")
+    print(analogs_df)
+    print()
 
     print("="*80)
     print("✓ 所有測試完成!")

@@ -211,6 +211,30 @@ num_epochs = 10              # 訓練輪數
 max_length = 100             # 最大序列長度
 ```
 
+## Property-Guided RL 訓練
+
+除了原本的監督式 VAE 訓練，`gruvae/rl_trainer.py` 提供 `PropertyGuidedTrainer`（繼承自 `Trainer`），
+可以額外針對「結構規則」與「分子性質目標」用 REINFORCE 微調模型。用法跟一般訓練完全一樣，只要換一份
+config：
+
+```bash
+python train.py --config configs/train_property_guided.yaml
+```
+
+運作方式（詳見該檔案內的註解）：
+- 前 `warmup_epochs` 個 epoch 只做原本的監督式訓練，讓模型先學會基本合法的 SMILES 語法
+- 之後每個 epoch 會用目前模型採樣一批分子，依序用 `filter_api`（結構規則）跟 `inference_api`
+  + `target_spec`（性質目標，pareto front 排序）算出 reward，做 policy gradient 更新
+- 這一輪 pareto front 1（最好的一層）且結構合規的分子會累積進 **elite buffer**，之後每個 epoch
+  都會額外用 elite buffer 裡的分子做一次標準監督式訓練，讓「一直表現很好」的分子持續留在訓練資料中
+- 每一輪 front 1 分子的結構與性質會即時印出來，同時累積寫進
+  `<checkpoint.save_dir>/front1_log.csv`，訓練過程中可以直接打開這個 CSV 監看進度
+
+`filter_api`（`gruvae/filters.py` 的 `StructureFilter`）與 `inference_api`
+（`gruvae/properties.py` 的 `PropertyInferenceAPI`）都只是先求可用的簡單預設實作，
+可以依實際需求換成自己的規則或性質計算模型，只要保持 `filter_api(smiles_list) -> List[str]`
+與 `inference_api.inference_pipeline(smiles_list, properties) -> pd.DataFrame` 的介面即可。
+
 ## 模型使用
 
 ### 載入訓練好的模型

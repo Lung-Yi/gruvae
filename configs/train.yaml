@@ -50,6 +50,8 @@ validation:
 checkpoint:
   save_dir: './checkpoints/small'
   save_interval: 3     # 每幾個 epoch 保存一次
+  load_from: null      # 設定 .pt 檔案路徑會先載入該模型權重繼續訓練/微調
+                        # （會自動嘗試載入同目錄下的 tokenizer.json，確保詞彙表一致）
 
 # 設備設定
 device:

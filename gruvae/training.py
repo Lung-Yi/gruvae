@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, random_split
 import random
 
 from .tokenizer import SmilesTokenizer, canonicalize_smiles
-from .dataset import SmilesVAEDataset, collate_fn
+from .dataset import SmilesVAEDataset, DynamicSmilesDataset, collate_fn
 from .models import GRUVAE, TransformerVAE, compute_loss
 from .generation import VAEMoleculeGenerator
 from rdkit import RDLogger
@@ -530,30 +530,67 @@ def main(config_path='configs/train.yaml'):
     device = torch.device('cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu')
     print(f"使用設備: {device}\n")
 
-    # 建立 tokenizer
-    print("建立 tokenizer...")
-    tokenizer = SmilesTokenizer()
+    checkpoint_config = config['checkpoint']
+    save_dir = checkpoint_config['save_dir']
+    os.makedirs(save_dir, exist_ok=True)
 
-    # 從 CSV 讀取並建立詞彙表
+    # 是否要載入之前訓練好的模型權重繼續訓練/微調
+    load_from = checkpoint_config.get('load_from')
+
+    # 從 CSV 讀取 SMILES
     train_csv = config['data']['train_csv']
     df = pd.read_csv(train_csv)
     smiles_list = df['smiles'].tolist()
-    tokenizer.build_vocab(smiles_list)
 
-    # 保存 tokenizer
-    save_dir = config['checkpoint']['save_dir']
-    os.makedirs(save_dir, exist_ok=True)
+    # 建立 tokenizer：如果有指定 load_from，優先使用該模型旁邊既有的 tokenizer.json，
+    # 確保詞彙表跟預訓練權重一致（否則詞彙索引對不上，載入的權重會完全失效）
+    tokenizer = SmilesTokenizer()
+    pretrained_tokenizer_path = None
+    if load_from:
+        candidate = os.path.join(os.path.dirname(load_from), 'tokenizer.json')
+        if os.path.exists(candidate):
+            pretrained_tokenizer_path = candidate
+
+    if pretrained_tokenizer_path:
+        print(f"載入預訓練模型旁的 tokenizer: {pretrained_tokenizer_path}")
+        tokenizer.load(pretrained_tokenizer_path)
+    else:
+        print("建立 tokenizer...")
+        tokenizer.build_vocab(smiles_list)
+
+    # 保存 tokenizer（這次執行的 checkpoint 目錄下也留一份）
     tokenizer.save(os.path.join(save_dir, 'tokenizer.json'))
 
     # 分割訓練/驗證集
     print("\n建立 Dataset...")
     max_length = config['data']['max_length']
-    dataset = SmilesVAEDataset(train_csv, tokenizer, max_length=max_length)
-
     train_split = config['data']['train_split']
-    train_size = int(train_split * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    property_guided_config = config.get('property_guided', {})
+    pg_enabled = property_guided_config.get('enabled', False)
+
+    filter_api = None
+    if pg_enabled:
+        # Property-guided 模式下，訓練資料只保留符合結構規則 (filter_api) 的 SMILES，
+        # 之後訓練過程中也會動態新增/淘汰分子，所以這裡用可變的 DynamicSmilesDataset
+        filter_api = build_structure_filter(property_guided_config)
+        num_before = len(smiles_list)
+        filtered_smiles_list = filter_api(smiles_list)
+        print(
+            f"訓練資料結構過濾: {num_before} -> {len(filtered_smiles_list)} "
+            f"(只保留通過 filter_api 的 SMILES)"
+        )
+
+        shuffled_smiles = filtered_smiles_list[:]
+        random.shuffle(shuffled_smiles)
+        train_size = int(train_split * len(shuffled_smiles))
+        train_dataset = DynamicSmilesDataset(shuffled_smiles[:train_size])
+        val_dataset = DynamicSmilesDataset(shuffled_smiles[train_size:])
+    else:
+        dataset = SmilesVAEDataset(train_csv, tokenizer, max_length=max_length)
+        train_size = int(train_split * len(dataset))
+        val_size = len(dataset) - train_size
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
     print(f"訓練集: {len(train_dataset)}, 驗證集: {len(val_dataset)}")
 
@@ -566,7 +603,11 @@ def main(config_path='configs/train.yaml'):
         batch_size=batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length),
-        num_workers=num_workers
+        num_workers=num_workers,
+        # BatchNorm 在 train 模式下要求每個 batch 至少有 2 筆資料；
+        # property-guided 模式下訓練資料筆數每個 epoch 都會變動，把最後不足一個 batch
+        # 的資料丟掉可以避免剛好卡到 batch size = 1 而噴錯
+        drop_last=True
     )
 
     val_loader = DataLoader(
@@ -615,12 +656,18 @@ def main(config_path='configs/train.yaml'):
     print(f"模型類型: {model_type.upper()}")
     print(f"模型參數量: {sum(p.numel() for p in model.parameters()):,}")
 
+    # 載入之前訓練好的模型權重（warm start / 微調用，不會恢復 optimizer 狀態或 epoch 計數）
+    if load_from:
+        print(f"\n載入預訓練模型權重: {load_from}")
+        pretrained_checkpoint = torch.load(load_from, map_location=device)
+        model.load_state_dict(pretrained_checkpoint['model_state_dict'])
+        print("✓ 預訓練權重載入完成")
+
     # 建立訓練器
     training_config = config['training']
     validation_config = config['validation']
-    checkpoint_config = config['checkpoint']
 
-    trainer = Trainer(
+    common_trainer_kwargs = dict(
         model=model,
         tokenizer=tokenizer,
         train_loader=train_loader,
@@ -638,6 +685,72 @@ def main(config_path='configs/train.yaml'):
         num_sample=validation_config['num_sample']
     )
 
+    if pg_enabled:
+        print("\n啟用 Property-Guided RL 訓練模式")
+        trainer = build_property_guided_trainer(
+            common_trainer_kwargs, property_guided_config,
+            default_max_length=max_length, filter_api=filter_api
+        )
+    else:
+        trainer = Trainer(**common_trainer_kwargs)
+
     # 開始訓練
     num_epochs = training_config['num_epochs']
     trainer.train(num_epochs=num_epochs)
+
+
+def build_structure_filter(pg_config: dict):
+    """依 config 的 `property_guided.structure_filter` 區塊建立 filter_api"""
+    from .filters import StructureFilter
+
+    filter_config = pg_config.get('structure_filter', {})
+    filter_kwargs = {
+        k: v for k, v in dict(
+            max_ring_size=filter_config.get('max_ring_size', 8),
+            max_heavy_atoms=filter_config.get('max_heavy_atoms', 60),
+            min_heavy_atoms=filter_config.get('min_heavy_atoms', 2),
+            forbidden_smarts=filter_config.get('forbidden_smarts'),
+            desired_smarts=filter_config.get('desired_smarts'),
+            require_all_desired=filter_config.get('require_all_desired', True),
+        ).items() if v is not None
+    }
+    return StructureFilter(**filter_kwargs)
+
+
+def build_property_guided_trainer(common_trainer_kwargs: dict, pg_config: dict, default_max_length: int, filter_api):
+    """依 config 的 `property_guided` 區塊建立 PropertyGuidedTrainer"""
+    from .rl_trainer import PropertyGuidedTrainer
+    from .properties import PropertyInferenceAPI
+    from .pareto import PropertySpec
+
+    inference_api = PropertyInferenceAPI()
+
+    target_spec = {}
+    for prop_name, spec_config in pg_config['target_spec'].items():
+        target_spec[prop_name] = PropertySpec(
+            goal=spec_config['goal'],
+            low=spec_config.get('low'),
+            high=spec_config.get('high'),
+        )
+
+    dynamic_pool_config = pg_config.get('dynamic_training_data', {})
+
+    return PropertyGuidedTrainer(
+        **common_trainer_kwargs,
+        filter_api=filter_api,
+        inference_api=inference_api,
+        target_spec=target_spec,
+        max_length=pg_config.get('max_length', default_max_length),
+        num_samples_per_round=pg_config.get('num_samples_per_round', 256),
+        num_rl_rounds_per_epoch=pg_config.get('num_rl_rounds_per_epoch', 1),
+        warmup_epochs=pg_config.get('warmup_epochs', 5),
+        reward_invalid=pg_config.get('reward_invalid', -1.0),
+        reward_structure_fail=pg_config.get('reward_structure_fail', -0.5),
+        reward_pass_base=pg_config.get('reward_pass_base', 0.0),
+        reward_pass_max=pg_config.get('reward_pass_max', 1.0),
+        prior_kl_weight=pg_config.get('prior_kl_weight', 0.1),
+        sampling_temperature=pg_config.get('sampling_temperature', 1.0),
+        dynamic_pool_enabled=dynamic_pool_config.get('enabled', True),
+        dynamic_pool_max_size=dynamic_pool_config.get('max_pool_size', 500),
+        front1_log_path=pg_config.get('front1_log_path'),
+    )

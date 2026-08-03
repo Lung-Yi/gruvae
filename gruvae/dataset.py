@@ -66,6 +66,38 @@ class SmilesVAEDataset(Dataset):
         return canonical_smiles, canonical_smiles
 
 
+class DynamicSmilesDataset(Dataset):
+    """
+    訓練過程中內容可以動態調整的 SMILES Dataset。
+
+    - base_smiles：固定不變的真實訓練資料
+    - dynamic_smiles：由外部（例如 PropertyGuidedTrainer）整批替換的動態資料，
+      用來讓「訓練過程中新發現的優質分子」持續存在於訓練資料中。
+      這個類別本身不做任何「好壞」判斷，只是單純的容器，
+      新增/淘汰的邏輯交給呼叫端（用 set_dynamic_smiles 整批覆蓋）。
+    """
+
+    def __init__(self, base_smiles: List[str]):
+        self.base_smiles = list(base_smiles)
+        self.dynamic_smiles: List[str] = []
+
+    def set_dynamic_smiles(self, smiles_list: List[str]) -> None:
+        """整批覆蓋目前的動態資料（呼叫端已經決定好要保留哪些分子）"""
+        self.dynamic_smiles = list(smiles_list)
+
+    def __len__(self) -> int:
+        return len(self.base_smiles) + len(self.dynamic_smiles)
+
+    def __getitem__(self, idx: int) -> Tuple[str, str]:
+        if idx < len(self.base_smiles):
+            smiles = self.base_smiles[idx]
+        else:
+            smiles = self.dynamic_smiles[idx - len(self.base_smiles)]
+
+        canonical_smiles = canonicalize_smiles(smiles)
+        return canonical_smiles, canonical_smiles
+
+
 def collate_fn(
     batch: List[Tuple[str, str]],
     tokenizer: SmilesTokenizer,

@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
+from .sampling import sample_next_token
+
 
 class GRUEncoder(nn.Module):
     """GRU Encoder - 將輸入序列編碼為潛在向量"""
@@ -208,6 +210,54 @@ class GRUDecoder(nn.Module):
 
         return output
 
+    def generate(
+        self,
+        z: torch.Tensor,
+        start_idx: int,
+        max_length: int,
+        sampling_mode: str = 'greedy',
+        temperature: float = 1.0
+    ) -> torch.Tensor:
+        """
+        自回歸生成，支援 greedy（原本 sample() 用的方式）或 multinomial 隨機採樣。
+        multinomial 模式提供真正的 token-level 隨機性，供 RL 訓練使用。
+
+        Args:
+            z: [batch_size, latent_dim] - 潛在向量
+            start_idx: START token 的索引
+            max_length: 最大序列長度
+            sampling_mode: 'greedy' 或 'multinomial'
+            temperature: multinomial 模式下的取樣溫度
+
+        Returns:
+            tokens: [batch_size, max_length] - 生成的序列
+        """
+        batch_size = z.size(0)
+        device = z.device
+
+        h = self.latent_to_hidden(z)
+        h = h.view(batch_size, self.num_layers, self.hidden_dim)
+        h = h.permute(1, 0, 2).contiguous()
+
+        input_token = torch.full((batch_size, 1), start_idx, dtype=torch.long, device=device)
+        tokens = []
+
+        for _ in range(max_length):
+            embedded = self.embedding(input_token)
+            output, h = self.gru(embedded, h)
+
+            output = output.permute(0, 2, 1)
+            output = self.bn(output)
+            output = output.permute(0, 2, 1)
+
+            logits = self.fc_out(output)  # [batch_size, 1, vocab_size]
+            next_token = sample_next_token(logits, sampling_mode=sampling_mode, temperature=temperature)
+
+            tokens.append(next_token)
+            input_token = next_token
+
+        return torch.cat(tokens, dim=1)
+
 
 class GRUVAE(nn.Module):
     """完整的 GRU-VAE 模型"""
@@ -328,6 +378,33 @@ class GRUVAE(nn.Module):
             samples = output.argmax(dim=-1)
 
         return samples
+
+    def sample_stochastic(
+        self,
+        num_samples: int,
+        max_length: int,
+        start_idx: int,
+        device: torch.device,
+        sampling_mode: str = 'multinomial',
+        temperature: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        從潛在空間採樣生成新分子，並回傳採樣用的 z。
+        跟 sample() 的差別是這裡預設用 multinomial 隨機採樣（而非 greedy），
+        且回傳 z 讓呼叫端可以之後用同一個 z 重新做 teacher forcing（例如 RL 微調時計算 log-prob）。
+
+        Returns:
+            tokens: [num_samples, max_length]
+            z: [num_samples, latent_dim]
+        """
+        self.eval()
+        with torch.no_grad():
+            z = torch.randn(num_samples, self.latent_dim).to(device)
+            tokens = self.decoder.generate(
+                z, start_idx, max_length,
+                sampling_mode=sampling_mode, temperature=temperature
+            )
+        return tokens, z
 
 
 def compute_loss(
