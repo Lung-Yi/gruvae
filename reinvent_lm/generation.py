@@ -18,6 +18,7 @@ RDLogger.DisableLog('rdApp.*')
 from .tokenizer import SmilesTokenizer, canonicalize_smiles, randomize_smiles
 from .models.lm import SmilesLM
 from .pareto import PropertySpec, assign_pareto_fronts
+from .seed_utils import derive_seed, set_seed
 
 
 class MoleculeGenerator:
@@ -183,15 +184,21 @@ class MoleculeGenerator:
         num_samples: int,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        seed: Optional[int] = None,
         display_molecules: bool = False,
         mols_per_row: int = 10,
         max_mols_per_image: int = 100,
     ) -> List[str]:
         """從 BOS token 開始隨機採樣生成分子
 
+        seed 有給值時，同一組參數重複呼叫會得到完全一樣的結果；不填則維持原本
+        每次呼叫都不同的隨機行為。
+
         display_molecules=True 時會額外畫出分子結構網格圖（每列 mols_per_row 個，
         每張圖最多 max_mols_per_image 個，超過自動分頁）。
         """
+        if seed is not None:
+            set_seed(seed)
         self.model.eval()
         with torch.no_grad():
             tokens = self.model.sample(
@@ -220,6 +227,7 @@ class MoleculeGenerator:
         randomize_input: bool = True,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        seed: Optional[int] = None,
         display_molecules: bool = False,
         mols_per_row: int = 10,
         max_mols_per_image: int = 100,
@@ -242,6 +250,9 @@ class MoleculeGenerator:
                 （每個樣本各自獨立抽一次新的隨機表示法，不是整批共用同一個）
             sampling_mode: 'greedy' 或 'multinomial'
             temperature: multinomial 模式下的取樣溫度
+            seed: (可選) 給值時，同一組參數重複呼叫會得到完全一樣的結果（涵蓋截斷比例、
+                randomize_input 的隨機表示法、以及模型的自回歸採樣）；不填則維持原本
+                每次呼叫都不同的隨機行為
             display_molecules: True 時額外畫出分子結構網格圖（每列 mols_per_row 個，
                 每張圖最多 max_mols_per_image 個，超過自動分頁）。smiles 為 list 時，
                 所有種子的鄰近分子會畫在同一組圖裡，legend 會標上 `[seed i]` 方便分辨
@@ -253,6 +264,8 @@ class MoleculeGenerator:
             smiles 為 list 時：List[List[str]]，跟輸入的 smiles list 順序一一對應，
                 每個子 list 長度都是 num_samples
         """
+        if seed is not None:
+            set_seed(seed)
         self.model.eval()
         single_input = isinstance(smiles, str)
         smiles_list = [smiles] if single_input else list(smiles)
@@ -266,9 +279,15 @@ class MoleculeGenerator:
         all_prefixes: List[List[int]] = []
         owner: List[int] = []  # all_prefixes[i] 屬於哪個 seed（smiles_list 的 index）
 
+        candidate_idx = 0
         for seed_idx, seed_smiles in enumerate(smiles_list):
             for _ in range(num_samples):
-                source = randomize_smiles(seed_smiles) if randomize_input else seed_smiles
+                if randomize_input:
+                    item_seed = None if seed is None else derive_seed(seed, candidate_idx)
+                    source = randomize_smiles(seed_smiles, seed=item_seed)
+                else:
+                    source = seed_smiles
+                candidate_idx += 1
                 base_indices = self.tokenizer.encode(source, add_special_tokens=False)
                 if len(base_indices) < 2:
                     # 隨機化失敗或分子過短時，退回用原始種子 SMILES
@@ -331,6 +350,7 @@ class MoleculeGenerator:
         randomize_input: bool = True,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        seed: Optional[int] = None,
         filter_api=None,
         inference_api=None,
         target_spec: Optional[Dict[str, PropertySpec]] = None,
@@ -355,6 +375,7 @@ class MoleculeGenerator:
             num_candidates: 「每個」種子取樣的候選分子數量
             truncate_fraction / truncate_fraction_range / randomize_input / sampling_mode / temperature:
                 同 sample_from_prefix
+            seed: (可選) 見 sample_from_prefix 的說明；不填則維持原本每次呼叫都不同的隨機行為
             filter_api: 結構規則過濾器，簽名為 filter_api(smiles_list) -> List[str]；不填則不過濾
             inference_api: 性質推論介面，需有 inference_pipeline(smiles_list, properties) -> DataFrame；
                 有提供 target_spec 時必填
@@ -378,6 +399,7 @@ class MoleculeGenerator:
             truncate_fraction_range=truncate_fraction_range,
             randomize_input=randomize_input,
             sampling_mode=sampling_mode, temperature=temperature,
+            seed=seed,
         )
 
         candidate_rows = [
@@ -506,6 +528,49 @@ def test_generator():
     )
     print(f"  種子分子: {seed_smiles}")
     print(analogs_df)
+    print()
+
+    print("=" * 80)
+    print("測試 4: seed 可復現性")
+    print("=" * 80)
+    sample_a = generator.sample(8, seed=123)
+    sample_b = generator.sample(8, seed=123)
+    assert sample_a == sample_b, "generator.sample(seed=123) 兩次呼叫結果不一致"
+    sample_c = generator.sample(8, seed=456)
+    assert sample_a != sample_c, "不同 seed 應該（極高機率）產生不同結果"
+    print("  sample(seed=123) 兩次呼叫結果一致 ✓；換 seed=456 結果不同 ✓")
+
+    prefix_a = generator.sample_from_prefix(seed_smiles, num_samples=6, seed=123)
+    prefix_b = generator.sample_from_prefix(seed_smiles, num_samples=6, seed=123)
+    assert prefix_a == prefix_b, "sample_from_prefix(seed=123) 兩次呼叫結果不一致"
+    print("  sample_from_prefix(seed=123) 兩次呼叫結果一致 ✓")
+
+    analogs_a = generator.generate_analogs(
+        seed_smiles, num_candidates=20,
+        filter_api=StructureFilter(), inference_api=PropertyInferenceAPI(),
+        target_spec={
+            "ClogP": PropertySpec(goal="range", low=1.0, high=3.0),
+            "SAScore": PropertySpec(goal="minimize"),
+        },
+        top_k=5, seed=123,
+    )
+    analogs_b = generator.generate_analogs(
+        seed_smiles, num_candidates=20,
+        filter_api=StructureFilter(), inference_api=PropertyInferenceAPI(),
+        target_spec={
+            "ClogP": PropertySpec(goal="range", low=1.0, high=3.0),
+            "SAScore": PropertySpec(goal="minimize"),
+        },
+        top_k=5, seed=123,
+    )
+    assert analogs_a['smiles'].tolist() == analogs_b['smiles'].tolist(), \
+        "generate_analogs(seed=123) 兩次呼叫結果不一致"
+    print("  generate_analogs(seed=123) 兩次呼叫結果一致 ✓")
+
+    no_seed_a = generator.sample(8)
+    no_seed_b = generator.sample(8)
+    assert no_seed_a != no_seed_b, "不傳 seed 時應維持原本每次呼叫都不同的隨機行為"
+    print("  不傳 seed 時維持原本非固定隨機行為 ✓")
     print()
 
     print("=" * 80)

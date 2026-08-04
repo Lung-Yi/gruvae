@@ -662,6 +662,9 @@ if __name__ == "__main__":
     from .models.lm import SmilesLM
     from .filters import StructureFilter
     from .properties import PropertyInferenceAPI
+    from .seed_utils import set_seed
+
+    set_seed(42)
 
     smiles_samples = ["CCO", "c1ccccc1", "CC(=O)O", "CCN", "CCCC", "c1ccncc1"] * 20
 

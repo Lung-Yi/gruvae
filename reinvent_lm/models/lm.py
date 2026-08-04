@@ -8,6 +8,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 from .sampling import sample_next_token
+from ..seed_utils import set_seed
 
 
 class SmilesLM(nn.Module):
@@ -67,13 +68,20 @@ class SmilesLM(nn.Module):
         device: torch.device,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
         從 BOS token 開始逐步自回歸生成（REINVENT Agent 的採樣方式）
 
+        seed 有給值時，函式最開頭會呼叫 seed_utils.set_seed(seed) 種好全域 RNG，
+        讓「同 seed、同輸入參數 -> 同輸出」成立（給 MoleculeGenerator 等獨立於
+        訓練流程之外呼叫的場合用；seed=None 時完全不影響現有行為）。
+
         Returns:
             tokens: [num_samples, max_length]
         """
+        if seed is not None:
+            set_seed(seed)
         self.eval()
         with torch.no_grad():
             input_token = torch.full((num_samples, 1), start_idx, dtype=torch.long, device=device)
@@ -97,6 +105,7 @@ class SmilesLM(nn.Module):
         max_length: int,
         sampling_mode: str = 'multinomial',
         temperature: float = 1.0,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
         把 prefix_tokens teacher-force 過 GRU 取得該點的 hidden state，
@@ -105,10 +114,13 @@ class SmilesLM(nn.Module):
         Args:
             prefix_tokens: [num_samples, prefix_len]，已含 START token，不含 END/PAD
             max_length: 總長度上限（含 prefix）
+            seed: (可選) 見 sample() 的說明
 
         Returns:
             tokens: [num_samples, max_length - prefix_len]，接續 prefix 之後生成的部分
         """
+        if seed is not None:
+            set_seed(seed)
         self.eval()
         num_samples = prefix_tokens.size(0)
         device = prefix_tokens.device

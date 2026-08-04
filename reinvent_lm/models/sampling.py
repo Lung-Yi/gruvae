@@ -1,5 +1,7 @@
 """解碼時共用的取樣工具（greedy / multinomial）"""
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -7,7 +9,8 @@ import torch.nn.functional as F
 def sample_next_token(
     logits: torch.Tensor,
     sampling_mode: str = 'greedy',
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """
     根據 logits 選出下一個 token
@@ -17,6 +20,7 @@ def sample_next_token(
         sampling_mode: 'greedy'（原本的行為，取機率最大值）或
                        'multinomial'（依機率分布隨機採樣，RL 訓練需要真正的隨機性時使用）
         temperature: multinomial 模式下的取樣溫度
+        generator: (可選) 傳給 torch.multinomial 的 torch.Generator，不填則用全域 RNG
 
     Returns:
         next_token: [batch_size, 1]
@@ -28,7 +32,7 @@ def sample_next_token(
         next_token = logits.argmax(dim=-1, keepdim=True)
     elif sampling_mode == 'multinomial':
         probs = F.softmax(logits / temperature, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        next_token = torch.multinomial(probs, num_samples=1, generator=generator)
     else:
         raise ValueError(f"不支援的 sampling_mode: {sampling_mode}，請用 'greedy' 或 'multinomial'")
 

@@ -10,6 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 from typing import List, Optional
 
 from .tokenizer import SmilesTokenizer, canonicalize_smiles, randomize_smiles
+from .seed_utils import derive_seed
 
 
 def pad_to_len(seq, max_len, pad_id):
@@ -43,6 +44,7 @@ class SmilesLMDataset(Dataset):
         max_length: Optional[int] = None,
         smiles_list: Optional[List[str]] = None,
         randomize: bool = False,
+        seed: int = 0,
     ):
         """
         Args:
@@ -51,10 +53,16 @@ class SmilesLMDataset(Dataset):
                 （train/val 需要各自不同的 randomize 設定時，由呼叫端先切好 list 再傳進來）
             tokenizer / max_length: 保留參數，不影響這個類別本身的行為（實際編碼在 collate_fn 做）
             randomize: True 時每次取用都重新隨機化 SMILES 書寫法；False 時固定回傳 canonical 寫法
+            seed: randomize=True 時，`(seed, epoch, idx)` 會被混合成該 item 的專屬
+                隨機化 seed（見 __getitem__），讓結果不依賴 DataLoader worker 數量/
+                行程排程，只要三者相同就一定重現同一個結果。搭配 set_epoch() 使用，
+                讓同一個分子在不同 epoch 仍然拿到不同的隨機書寫法。
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.randomize = randomize
+        self.seed = seed
+        self._epoch = 0
 
         if smiles_list is not None:
             self.smiles_list = list(smiles_list)
@@ -66,13 +74,25 @@ class SmilesLMDataset(Dataset):
 
         print(f"載入 {len(self.smiles_list)} 個 SMILES" + ("（訓練時隨機化 SMILES）" if randomize else ""))
 
+    def set_epoch(self, epoch: int) -> None:
+        """
+        訓練迴圈每個 epoch 開始（建立/迭代該 epoch 的 DataLoader 之前）都要呼叫一次，
+        讓 __getitem__ 算出的 per-item seed 隨 epoch 變化（同一個分子每個 epoch 仍會
+        拿到不同的隨機書寫法），也讓 num_workers>0 時新 fork 出來的 worker 能拿到
+        正確的 _epoch 值（沿用 PyTorch DistributedSampler.set_epoch() 的慣例寫法）。
+        """
+        self._epoch = epoch
+
     def __len__(self) -> int:
         return len(self.smiles_list)
 
     def __getitem__(self, idx: int) -> str:
         """回傳規範化或隨機化的 SMILES（在 collate_fn 中才編碼）"""
         smiles = self.smiles_list[idx]
-        return randomize_smiles(smiles) if self.randomize else canonicalize_smiles(smiles)
+        if not self.randomize:
+            return canonicalize_smiles(smiles)
+        item_seed = derive_seed(self.seed, self._epoch, idx)
+        return randomize_smiles(smiles, seed=item_seed)
 
 
 class DynamicSmilesLMDataset(Dataset):
@@ -85,10 +105,16 @@ class DynamicSmilesLMDataset(Dataset):
     - randomize：跟 SmilesLMDataset 意義相同，對 base_smiles 跟 dynamic_smiles 都適用。
     """
 
-    def __init__(self, base_smiles: List[str], randomize: bool = False):
+    def __init__(self, base_smiles: List[str], randomize: bool = False, seed: int = 0):
         self.base_smiles = list(base_smiles)
         self.dynamic_smiles: List[str] = []
         self.randomize = randomize
+        self.seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """見 SmilesLMDataset.set_epoch()。"""
+        self._epoch = epoch
 
     def set_dynamic_smiles(self, smiles_list: List[str]) -> None:
         """整批覆蓋目前的動態資料（呼叫端已經決定好要保留哪些分子）"""
@@ -102,7 +128,10 @@ class DynamicSmilesLMDataset(Dataset):
             smiles = self.base_smiles[idx]
         else:
             smiles = self.dynamic_smiles[idx - len(self.base_smiles)]
-        return randomize_smiles(smiles) if self.randomize else canonicalize_smiles(smiles)
+        if not self.randomize:
+            return canonicalize_smiles(smiles)
+        item_seed = derive_seed(self.seed, self._epoch, idx)
+        return randomize_smiles(smiles, seed=item_seed)
 
 
 def collate_fn(
@@ -196,5 +225,19 @@ if __name__ == "__main__":
     non_randomized_dataset = SmilesLMDataset(smiles_list=[seed], randomize=False)
     assert non_randomized_dataset[0] == seed_canonical
     print("randomize=False 固定回傳 canonical 寫法 ✓")
+
+    # 可復現性：相同 (seed, epoch, idx) 兩次重跑（不同的 Dataset 實例）必須得到同一個結果，
+    # 不同的 epoch 則應該（極高機率）得到不同的結果
+    ds_a = SmilesLMDataset(smiles_list=[seed] * 5, randomize=True, seed=123)
+    ds_b = SmilesLMDataset(smiles_list=[seed] * 5, randomize=True, seed=123)
+    ds_a.set_epoch(3)
+    ds_b.set_epoch(3)
+    epoch3_a = [ds_a[i] for i in range(5)]
+    epoch3_b = [ds_b[i] for i in range(5)]
+    assert epoch3_a == epoch3_b, "同一個 (seed, epoch) 兩個 Dataset 實例結果不一致"
+    ds_a.set_epoch(4)
+    epoch4_a = [ds_a[i] for i in range(5)]
+    assert epoch4_a != epoch3_a, "不同 epoch 應該（極高機率）產生不同的隨機書寫法"
+    print("randomize=True 在相同 (seed, epoch, idx) 下可重現、不同 epoch 結果不同 ✓")
 
     print("✓ Dataset 基本測試通過")

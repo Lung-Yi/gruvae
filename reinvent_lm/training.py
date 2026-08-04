@@ -17,6 +17,7 @@ import random
 from .tokenizer import SmilesTokenizer
 from .dataset import SmilesLMDataset, DynamicSmilesLMDataset, collate_fn
 from .models.lm import SmilesLM
+from .seed_utils import set_seed, seed_worker
 from rdkit import Chem
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -63,6 +64,8 @@ class Trainer:
 
     def train_epoch(self, epoch: int) -> dict:
         """訓練一個 epoch"""
+        if hasattr(self.train_loader.dataset, 'set_epoch'):
+            self.train_loader.dataset.set_epoch(epoch)
         self.model.train()
 
         total_loss = 0
@@ -218,9 +221,8 @@ def main(config_path='configs/train_reinvent.yaml'):
     print(f"配置載入成功!\n")
 
     seed = config['seed']
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+    deterministic_cuda = config['device'].get('deterministic_cuda', True)
+    set_seed(seed, deterministic_cuda=deterministic_cuda)
 
     use_cuda = config['device']['use_cuda']
     device = torch.device('cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu')
@@ -277,22 +279,30 @@ def main(config_path='configs/train_reinvent.yaml'):
         shuffled_smiles = filtered_smiles_list[:]
         random.shuffle(shuffled_smiles)
         train_size = int(train_split * len(shuffled_smiles))
-        train_dataset = DynamicSmilesLMDataset(shuffled_smiles[:train_size], randomize=randomize_training_smiles)
-        val_dataset = DynamicSmilesLMDataset(shuffled_smiles[train_size:], randomize=False)
+        train_dataset = DynamicSmilesLMDataset(
+            shuffled_smiles[:train_size], randomize=randomize_training_smiles, seed=seed
+        )
+        val_dataset = DynamicSmilesLMDataset(shuffled_smiles[train_size:], randomize=False, seed=seed)
     else:
         # 直接切 smiles list 分別建兩個 Dataset（而不是用 random_split 包同一個 Dataset 實例），
         # 這樣訓練集/驗證集才能各自套用不同的 randomize 設定
         shuffled_smiles = smiles_list[:]
         random.shuffle(shuffled_smiles)
         train_size = int(train_split * len(shuffled_smiles))
-        train_dataset = SmilesLMDataset(smiles_list=shuffled_smiles[:train_size], randomize=randomize_training_smiles)
-        val_dataset = SmilesLMDataset(smiles_list=shuffled_smiles[train_size:], randomize=False)
+        train_dataset = SmilesLMDataset(
+            smiles_list=shuffled_smiles[:train_size], randomize=randomize_training_smiles, seed=seed
+        )
+        val_dataset = SmilesLMDataset(smiles_list=shuffled_smiles[train_size:], randomize=False, seed=seed)
 
     print(f"訓練集: {len(train_dataset)}, 驗證集: {len(val_dataset)}")
 
     batch_size = config['training']['batch_size']
     num_workers = config['training']['num_workers']
 
+    # persistent_workers 明確鎖在 False：RL 動態訓練池（DynamicSmilesLMDataset.set_dynamic_smiles）
+    # 會在 epoch 之間直接改動 Dataset 物件的內容，若 worker 跨 epoch 存活（persistent_workers=True），
+    # 已經 fork 出去的 worker 會看不到這個更新，動態池同步會被悄悄破壞；False（預設行為）時每個
+    # epoch 重新 fork worker，才能保證看到 main process 最新的 dataset 狀態。
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -300,6 +310,8 @@ def main(config_path='configs/train_reinvent.yaml'):
         collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length),
         num_workers=num_workers,
         drop_last=True,
+        persistent_workers=False,
+        worker_init_fn=seed_worker if num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -308,6 +320,8 @@ def main(config_path='configs/train_reinvent.yaml'):
         shuffle=False,
         collate_fn=lambda batch: collate_fn(batch, tokenizer, max_length=max_length),
         num_workers=num_workers,
+        persistent_workers=False,
+        worker_init_fn=seed_worker if num_workers > 0 else None,
     )
 
     print("\n建立模型...")

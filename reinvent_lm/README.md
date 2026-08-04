@@ -21,10 +21,11 @@ autoregressive 語言模型（比照 Olivecrona et al. 2017 / Blaschke et al. 20
 7. [快速開始](#快速開始)
 8. [YAML 設定檔詳細說明](#yaml-設定檔詳細說明)
 9. [Property-Guided RL 微調原理](#property-guided-rl-微調原理)
-10. [MoleculeGenerator API](#moleculegenerator-api)
-11. [Checkpoint 格式](#checkpoint-格式)
-12. [跟 gruvae (VAE) 的差異對照](#跟-gruvae-vae-的差異對照)
-13. [常見問題 / 訓練監控指標](#常見問題--訓練監控指標)
+10. [可復現性 (seed)](#可復現性-seed)
+11. [MoleculeGenerator API](#moleculegenerator-api)
+12. [Checkpoint 格式](#checkpoint-格式)
+13. [跟 gruvae (VAE) 的差異對照](#跟-gruvae-vae-的差異對照)
+14. [常見問題 / 訓練監控指標](#常見問題--訓練監控指標)
 
 ---
 
@@ -102,6 +103,7 @@ loss）。生成新分子時，反過來從 `<START>` 開始，每步用模型�
 ```
 reinvent_lm/
     __init__.py
+    seed_utils.py      # set_seed / derive_seed / seed_worker：可復現性 (seed) 相關工具
     tokenizer.py       # SmilesTokenizer：SMILES <-> token id 的編解碼、vocab 建立/存讀
     filters.py         # StructureFilter：結構規則過濾器 (filter_api 的預設實作)
     properties.py      # PropertyInferenceAPI：分子性質計算 (inference_api 的預設實作)
@@ -435,14 +437,15 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 | `training` | `num_epochs` | 訓練總 epoch 數 |
 | | `batch_size` | batch 大小 |
 | | `learning_rate` | Adam 學習率 |
-| | `num_workers` | DataLoader worker 數 |
+| | `num_workers` | DataLoader worker 數。設 >0 時安全可重現（見下方「可復現性 (seed)」一節），`persistent_workers` 固定為 `False`、並會自動掛上 `worker_init_fn` |
 | | `grad_clip_max_norm` | 梯度裁剪上限 |
 | `validation` | `num_sample` | 每個 epoch 驗證時自回歸生成幾個分子來算 validity rate |
 | `checkpoint` | `save_dir` | checkpoint / tokenizer.json 存放目錄 |
 | | `save_interval` | 每幾個 epoch 存一次 `checkpoint_epoch_N.pt`（另外 val loss 創新低時都會存 `best_model.pt`） |
 | | `load_from` | (可選) 之前訓練好的 `.pt` 路徑，設定後會先載入該權重繼續訓練/微調；同時會自動嘗試載入**同目錄下**的 `tokenizer.json` 以確保詞彙表一致（詞彙表不一致的話，權重的 embedding/輸出層索引會完全對不上，模型會壞掉） |
 | `device` | `use_cuda` | 是否使用 CUDA（不可用時自動退回 CPU） |
-| 頂層 | `seed` | 隨機種子（`torch`/`numpy`/`random` 都會設定） |
+| | `deterministic_cuda` | 預設 `true`。GPU 上額外開啟 cuDNN deterministic 模式，讓相同 seed 重跑訓練時 GPU 結果也能盡量 bit-exact 重現，見下方「可復現性 (seed)」一節 |
+| 頂層 | `seed` | 隨機種子，`reinvent_lm.seed_utils.set_seed()` 會統一種好 `torch`/`numpy`/`random`/RDKit，見下方「可復現性 (seed)」一節 |
 
 ### `configs/train_reinvent_property_guided.yaml`（RL 微調）
 
@@ -644,6 +647,75 @@ warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更�
 
 ---
 
+## 可復現性 (seed)
+
+固定 config 頂層的 `seed` 之後，純預訓練跟 property-guided RL 微調（含 `num_workers > 0`）
+重跑應該得到 bit-exact 一致的結果：每個 epoch 的 train/val loss、驗證階段自回歸生成的
+分子、RL 每輪的 `sampled`/`pass_filter`/`front1`/`mean_reward`/`loss_pg`/`loss_prior`、
+`front1_log.csv`/`elite_archive_log.csv` 內容、以及最終 checkpoint 的權重張量都已經
+實測驗證過完全一致（`num_workers=0` 與 `num_workers>0` 分別驗證過，GPU 上也驗證過）。
+
+### 涵蓋的隨機源（`reinvent_lm/seed_utils.py`）
+
+`training.py::main()` 開頭會呼叫一次 `seed_utils.set_seed(seed, deterministic_cuda=...)`，
+統一種好：
+
+- `random` / `numpy` / `torch`（`torch.manual_seed` 會連帶種到 CPU 與所有 CUDA device）
+- `deterministic_cuda=True`（`device.deterministic_cuda`，預設開啟）時，額外設定
+  `torch.backends.cudnn.deterministic = True`、`benchmark = False`，並開啟
+  `torch.use_deterministic_algorithms(True, warn_only=True)`。**已知限制**：極少數
+  cuDNN 版本下 GRU backward 仍可能無法保證 100% bit-exact，這是 PyTorch/cuDNN 本身的
+  限制，這裡採 best-effort，不強行解決。
+
+### `randomize_smiles`（SMILES enumeration 資料增強）跟 `num_workers > 0` 的相容性
+
+`tokenizer.py::randomize_smiles(smiles, seed=...)` 有給 `seed` 時，不是用 RDKit 自己的
+`doRandom=True`/`MolToRandomSmilesVect(randomSeed=...)`（**實測過這兩個 API 都不可靠**：
+即使呼叫前先呼叫 `rdBase.SeedRandomNumberGenerator(seed)`，只要同一個 process 裡先前發生
+過其他隨機 SMILES 呼叫，同一個 `seed` 也會產生不同結果——RDKit 內部似乎還有一份不會被這些
+API 重置的殘留狀態），而是改用「本地 `random.Random(seed)` 決定一個原子順序排列 →
+`Chem.RenumberAtoms` 實際重新編號 → `canonical=False`（不用任何 RNG）寫出 SMILES」這個
+組合，只依賴呼叫者自己算出的 `seed` 值，不依賴任何全域/跨行程共享的 RNG 狀態。
+
+`dataset.py` 的 `SmilesLMDataset`/`DynamicSmilesLMDataset` 建構時吃一個 `seed` 參數，
+`__getitem__(idx)` 會用 `(seed, 目前 epoch, idx)` 三者混合出這個 item 專屬的 seed
+（`seed_utils.derive_seed`，內部用 `numpy.random.SeedSequence` 做混合），並提供
+`set_epoch(epoch)` 方法（`Trainer.train_epoch()` 每個 epoch 開始都會呼叫一次）讓同一個
+分子在不同 epoch 仍然拿到不同的隨機書寫法。因為 per-item seed 只是 `(seed, epoch, idx)`
+的 deterministic 函式，不依賴任何跨行程共享狀態，`num_workers > 0` 時不論哪個 worker
+處理哪個 idx、worker 何時被 fork，結果都保證一致——這正是一般 PyTorch `DataLoader`
+在 `num_workers > 0` 時最容易踩的雷（worker fork 會複製當下的全域 RNG 狀態，PyTorch
+只會自動幫 `torch` 自己的 RNG 依 worker 分別重新 seed，不會處理 `random`/`numpy`/RDKit）。
+`training.py` 也額外把 `persistent_workers` 鎖在 `False`（worker 每個 epoch 重新 fork，
+才能保證看到 RL 動態訓練池 `set_dynamic_smiles()` 的最新內容）並在 `num_workers > 0`
+時掛上 `worker_init_fn=seed_utils.seed_worker`（防禦性補強，防止其他程式碼在 worker
+裡用到全域隨機性）。
+
+### `MoleculeGenerator` 的 `seed` 參數
+
+`sample()` / `sample_from_prefix()` / `generate_analogs()` 都有一個可選的 `seed`
+參數，訓練流程之外獨立呼叫時也能保證「同一組參數 + 同一個 seed → 同一個結果」：
+
+```python
+mols_a = generator.sample(10, seed=123)
+mols_b = generator.sample(10, seed=123)
+assert mols_a == mols_b          # 一定成立
+
+mols_c = generator.sample(10)    # 不傳 seed：維持原本每次呼叫都不同的隨機行為
+```
+
+不傳 `seed`（預設 `None`）時完全維持原本的行為，不影響既有用法。
+
+### 已知限制
+
+- **Checkpoint 中途 resume**：`.pt` 只存 `model_state_dict`/`optimizer_state_dict`/
+  `history`，不含當下的 RNG 狀態。從 checkpoint 恢復訓練會讓隨機序列從
+  `set_seed()` 重新開始，不等於「沒中斷地跑完整段訓練」的結果（這是常見 ML 框架的
+  通用限制，這裡沒有特別處理）。
+- **GPU determinism 為 best-effort**：見上面 `deterministic_cuda` 的說明。
+
+---
+
 ## MoleculeGenerator API
 
 `reinvent_lm/generation.py` 的 `MoleculeGenerator`，訓練完之後方便使用的推論介面。
@@ -664,13 +736,14 @@ generator = MoleculeGenerator(
 （也支援直接傳入已經存在的 `model`/`tokenizer`/`max_length` 三個參數，適合模型已經在
 記憶體中、不想重新從磁碟載入權重的情境；一般使用建議用上面「從檢查點載入」的方式。）
 
-### `sample(num_samples, sampling_mode='multinomial', temperature=1.0, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> List[str]`
+### `sample(num_samples, sampling_mode='multinomial', temperature=1.0, seed=None, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> List[str]`
 
 從 `<START>` 開始隨機生成 `num_samples` 個全新分子。`sampling_mode` 可以是
 `'multinomial'`（依機率分布抽樣，有多樣性）或 `'greedy'`（每步都選機率最大的 token，
-結果是確定性的，多次呼叫會拿到一樣的分子）。
+結果是確定性的，多次呼叫會拿到一樣的分子）。`seed` 給值時，`'multinomial'` 模式下
+同一組參數重複呼叫也會得到一樣的結果，見上面「可復現性 (seed)」一節。
 
-### `sample_from_prefix(smiles, num_samples, truncate_fraction=None, truncate_fraction_range=(0.3, 0.7), randomize_input=True, sampling_mode='multinomial', temperature=1.0, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> List[str] | List[List[str]]`
+### `sample_from_prefix(smiles, num_samples, truncate_fraction=None, truncate_fraction_range=(0.3, 0.7), randomize_input=True, sampling_mode='multinomial', temperature=1.0, seed=None, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> List[str] | List[List[str]]`
 
 因為這個架構**沒有連續潛在空間**，沒辦法像 VAE 那樣「編碼成 z、加點雜訊、解碼回來」做
 鄰近探索。這裡改用**截斷種子分子的 token 序列、讓模型接續自回歸生成剩下的部分**：
@@ -699,7 +772,7 @@ token 序列，長度可能都不一樣（不同隨機書寫法的 token 數不�
 長度分組，同一組內長度一致才一起 batch 做 teacher forcing，避免長度不同時得靠 padding
 湊齊、進而汙染 hidden state 的問題。
 
-### `generate_analogs(smiles, num_candidates=100, ..., randomize_input=True, filter_api=None, inference_api=None, target_spec=None, dedupe=True, top_k=None, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> pd.DataFrame`
+### `generate_analogs(smiles, num_candidates=100, ..., randomize_input=True, seed=None, filter_api=None, inference_api=None, target_spec=None, dedupe=True, top_k=None, display_molecules=False, mols_per_row=10, max_mols_per_image=100) -> pd.DataFrame`
 
 把 `sample_from_prefix` 取樣、去重複/去無效、`filter_api` 結構過濾、
 `inference_api` + `target_spec` 的 pareto front 排序串起來，一次做完「找一個（或一批）

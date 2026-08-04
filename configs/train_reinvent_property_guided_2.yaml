@@ -30,7 +30,7 @@ training:
   num_epochs: 100
   batch_size: 128
   learning_rate: 0.001
-  num_workers: 0
+  num_workers: 8
   grad_clip_max_norm: 1.0
 
 # 驗證設定
@@ -46,6 +46,13 @@ checkpoint:
 # 設備設定
 device:
   use_cuda: true
+  # GPU 上是否額外開啟 cuDNN deterministic 模式，讓相同 seed 重跑訓練時 GPU 上的
+  # 結果也能盡量 bit-exact 重現（詳細說明見 configs/train_reinvent.yaml）。預設開啟。
+  deterministic_cuda: true
+
+# 隨機種子：固定這個值後，訓練資料切分/洗牌、SMILES randomize 增強、模型初始化、
+# dropout、RL 採樣都會是同一個 seed 的 deterministic 函式，重跑應該得到一致的結果
+# （見 device.deterministic_cuda 的 GPU 限制說明）
 
 # 隨機種子
 seed: 42

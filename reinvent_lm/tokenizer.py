@@ -5,7 +5,8 @@ SMILES Tokenizer 模組
 
 import re
 import json
-from typing import List, Dict
+import random
+from typing import List, Dict, Optional
 from rdkit import Chem
 
 
@@ -133,17 +134,36 @@ class SmilesTokenizer:
         return self.token_to_idx[self.end_token]
 
 
-def randomize_smiles(smiles: str) -> str:
-    """隨機化 SMILES（改變原子順序但保持分子結構）"""
+def randomize_smiles(smiles: str, seed: Optional[int] = None) -> str:
+    """
+    隨機化 SMILES（改變原子順序但保持分子結構）
+
+    seed 不填時走原本的行為（`Chem.MolToSmiles(doRandom=True)`，用 RDKit 全域內部
+    RNG，不保證可重現）。
+
+    seed 有給值時，改用「Python 本地 random.Random(seed) 決定一個原子順序排列，
+    Chem.RenumberAtoms 依這個排列實際重新編號原子，再用 canonical=False（不排序、
+    不用任何 RNG，純粹依目前的原子編號寫出 SMILES）輸出」這個組合，而不是 RDKit
+    自己的 `MolToRandomSmilesVect(randomSeed=...)`——後者實測過**不可靠**：即使
+    每次呼叫前都先呼叫 `rdBase.SeedRandomNumberGenerator(seed)`，只要同一個
+    process 裡先前發生過其他隨機 SMILES 呼叫，同一個 seed 也會產生不同結果
+    （RDKit 內部似乎還有一份不會被這個 API 重置的殘留狀態）。`random.Random(seed)`
+    是完全獨立的本地實例，不依賴任何全域/跨行程共享狀態，也不受同一個 process 裡
+    先前呼叫過幾次隨機化影響，因此可以保證「同一個 seed 對同一個分子永遠得到
+    同一個結果」，包含 DataLoader `num_workers>0` 的情況。
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return smiles
 
-    # 使用不同的隨機種子生成不同的 SMILES 表示
     try:
-        random_smiles = Chem.MolToSmiles(mol, canonical=False, doRandom=True)
-        return random_smiles
-    except:
+        if seed is not None:
+            order = list(range(mol.GetNumAtoms()))
+            random.Random(seed).shuffle(order)
+            renumbered = Chem.RenumberAtoms(mol, order)
+            return Chem.MolToSmiles(renumbered, canonical=False)
+        return Chem.MolToSmiles(mol, canonical=False, doRandom=True)
+    except Exception:
         return smiles
 
 
