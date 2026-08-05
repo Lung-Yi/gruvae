@@ -465,6 +465,8 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 | `reward_pass_max` | 1.0 | 通過結構檢查、且相對於 `elite_archive` 的 pareto rank 最好（rank 0）的分子的 reward |
 | `elite_archive_rank` | 5 | 「菁英 archive」保留 pareto rank 0 ~ (`elite_archive_rank`-1) 的**所有**分子（依名次篩選，不是固定數量），同時也是 reward 名次縮放的分母上限，細節見下節「Elite Archive」 |
 | `reward_scale_power` | 1.0 | reward 名次縮放曲線的指數，`scale = (1 - rank/(elite_archive_rank-1)) ** reward_scale_power`。預設 1.0 是線性；調大（例如 2、3）會放大前幾名之間的 reward 差距、壓縮後段名次的差距 |
+| `reward_absolute_weight` | 0.0 | 混入多少「絕對」reward 分量（`0~1`），細節見下節「Reward 的絕對分量」。`0.0` 完全維持純相對 rank 行為 |
+| `reward_normalization_num_samples` | 5000 | 校準絕對分量正規化基準時，從 prior model 取樣幾個分子（只有 `reward_absolute_weight > 0` 時才用得到） |
 | `archive_stagnation_patience_epochs` | 3 | 連續幾個 epoch，`elite_archive` 的第 `archive_stagnation_watch_rank` 層成員完全沒有變化就視為訓練停滯，觸發一次 archive 清理 |
 | `archive_stagnation_watch_rank` | 1 | 停滯偵測要盯著看的 pareto rank（0-indexed，`1` = 你平常講的「front 2」）。不盯 rank 0 是因為 rank 0 本來就最難改善，長期不變是正常現象 |
 | `archive_prune_keep_rank` | 1 | 觸發停滯清理時，`elite_archive` 只保留 `rank < archive_prune_keep_rank` 的分子，其餘全部清掉，讓中段名次重新空出來競爭 |
@@ -589,6 +591,51 @@ warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更�
   CSV（不像 `front1_log_path` 是累積 append）——因為 archive 本身每輪都在更新，只需要
   看最新狀態，不需要留存歷史 epoch 紀錄。
 
+### Reward 的絕對分量：解決「相對排名只會越來越嚴格」的問題
+
+`elite_archive` 讓 reward 能反映「有沒有比歷史最好的分子更好」，但這個機制本質上是**相對**
+的：訓練前期 archive 還弱，容易拿到好名次；中期之後 archive 累積了很多歷史強分子，門檻越墊
+越高，越來越多分子的 reward 卡在同一個 `reward_pass_base`（不管實際上離目標多近多遠都一樣），
+REINFORCE 的 advantage（reward - batch 內平均）跟著趨近於零、梯度訊號消失。
+
+主流 REINVENT 系列（Olivecrona et al. 2017; Blaschke et al. 2020）的做法不同：reward 是
+**絕對**的（每個性質各自的 desirability 轉換函式固定不變，不會因為訓練進度改變）。
+`reward_absolute_weight > 0` 時，`_score_batch` 會額外算一個不受 `elite_archive` 狀態影響
+的絕對分量，跟原本的相對分量混合：
+
+```
+combined_scale = reward_absolute_weight * absolute_desirability + (1 - reward_absolute_weight) * relative_scale
+reward = reward_pass_base + (reward_pass_max - reward_pass_base) * combined_scale
+```
+
+絕對分量的計算（`_compute_absolute_desirability`）：對每個性質，把 `PropertySpec.to_objective()`
+算出的距離值轉成 z-score，再取指數：
+
+```
+z = (to_objective(value) - mean_ref) / std_ref
+desirability_i = exp(-max(z, 0))
+```
+
+`mean_ref`/`std_ref` 是**固定的**正規化基準（`_compute_reward_normalization_stats`），
+在 warmup 結束、`_snapshot_prior()` 之後只計算這一次：從 prior model 大量取樣
+（`reward_normalization_num_samples` 個分子）、過 `filter_api`、用 `inference_api` 算性質，
+統計每個性質 `to_objective()` 距離的平均值/標準差。之後整個訓練過程都固定不變，不會像
+`elite_archive` 那樣隨訓練漂移——這正是這個機制存在的意義。`max(z, 0)` 讓「比 prior model
+自然產出的族群平均還好」的分子一律拿接近滿分，只有比平均差的部分才開始衰減；對 `range`
+型性質這樣設計特別合理，因為 prior model 隨機產出的分子多數會落在窄目標區間外，`mean_ref`
+通常是正數，一個真的落在區間內的分子（`to_objective=0`）自然會拿到 `z<0`、被夾到
+`0`、`desirability=1`。
+
+多個性質的 `desirability_i` 用**幾何平均**合併成單一絕對分數（不是算術平均）：任一性質
+嚴重沒達標時，整體分數會被拉低，不會被其他性質平均掉——這也是 REINVENT 官方組合多個
+scoring component 時的慣例做法。
+
+`reward_absolute_weight` 預設 `0.0`，完全維持原本純相對排名的行為；`configs/train_reinvent_property_guided.yaml`
+教學設定檔目前示範設成 `1.0`（完全不看 `elite_archive` 的相對名次），方便單獨驗證這個
+機制本身的效果。校準樣本數（過 `filter_api` 後）不足 30 個時會印警告並自動停用絕對分量
+（等同 `reward_absolute_weight=0`），不會讓訓練中斷。每輪印出的統計行會多一個
+`abs_desirability` 欄位，可以用來監看這個分量的實際數值。
+
 ### 訓練後期的停滯問題與 Archive 清理
 
 `elite_archive` 穩定下來後（尤其目標是多個窄範圍 `range` 同時達標時），新採樣的分子會
@@ -624,7 +671,7 @@ warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更�
 ### 每輪印出的統計數字怎麼看
 
 ```
-[RL round 1/20] sampled=1024 valid=1020 pass_filter=180 front1=9 max_front=42 top5_fronts(1-5)=[9, 15, 22, 18, 20] dynamic_pool=3200 elite_archive=10 mean_reward=0.35 loss_pg=-0.12 loss_prior=1.84
+[RL round 1/20] sampled=1024 valid=1020 pass_filter=180 front1=9 max_front=42 top5_fronts(1-5)=[9, 15, 22, 18, 20] dynamic_pool=3200 elite_archive=10 mean_reward=0.35 abs_desirability=0.62 loss_pg=-0.12 loss_prior=1.84
 ```
 
 - `sampled` / `valid`：這輪取樣了幾個、其中幾個是 RDKit 能解析的合法分子
@@ -638,6 +685,8 @@ warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更�
 - `dynamic_pool`：目前動態訓練池累積的分子數（拿去訓練模型用）
 - `elite_archive`：目前 `elite_archive` 實際保留的分子數（只當 reward 比較基準用，
   不會被拿去訓練模型；因為是依 rank 篩選、不是固定數量，這個數字沒有上限，需要留意）
+- `abs_desirability`：這一輪分子的絕對分量平均值（見「Reward 的絕對分量」一節），只有
+  `reward_absolute_weight > 0` 時才有意義，`= 0.0` 代表沒開啟或校準樣本不足而自動停用
 - `mean_reward` / `loss_pg` / `loss_prior`：見上面流程說明。**如果 `loss_prior` 開始
   隨訓練不斷暴增（例如從個位數飆到幾萬幾十萬），通常代表模型已經嚴重偏離 warmup 時的
   樣子，是 mode collapse 的警訊**，可以考慮調高 `prior_kl_weight`、拉長 `warmup_epochs`，

@@ -79,25 +79,25 @@ property_guided:
   # 會把通過結構檢查的分子跟這個 archive 目前保留的分子合併做 pareto 排序，用「相對於
   # 歷史最佳前緣」的名次算 reward（見 train_reinvent_property_guided.yaml 的完整說明），
   # 而不是只跟同一輪隨機抽到的分子比較
-  elite_archive_rank: 10
+  elite_archive_rank: 50
 
   # reward 名次縮放曲線的指數，1.0 是線性（每階名次差距固定）。調大會放大前幾名之間
   # 的 reward 差距、壓縮後段名次的差距（見 train_reinvent_property_guided.yaml 完整說明）
-  reward_scale_power: 2.0
+  reward_scale_power: 1.5
 
   # 連續幾個 epoch archive 的第 archive_stagnation_watch_rank 層（預設 rank 1，也就是
   # 「front 2」）都沒變化就視為停滯，觸發清理：把 archive 清到只剩
   # rank < archive_prune_keep_rank 的分子（見 train_reinvent_property_guided.yaml
   # 完整說明），讓中段名次重新空出來競爭
-  archive_stagnation_patience_epochs: 1
-  archive_stagnation_watch_rank: 1
-  archive_prune_keep_rank: 1
+  archive_stagnation_patience_epochs: 100
+  archive_stagnation_watch_rank: 10
+  archive_prune_keep_rank: 10
 
   # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
   reward_invalid: -2.0
   reward_structure_fail: -1.0
   reward_pass_base: 1.0
-  reward_pass_max: 3.0
+  reward_pass_max: 6.0
 
   # Prior regularization 權重，防止 RL 微調時生成多樣性崩潰 (mode collapse)
   prior_kl_weight: 0.5
@@ -118,9 +118,9 @@ property_guided:
   # 分子性質目標 (target_spec)
   target_spec:
     ClogP:
-      goal: range
-      low: 5.0
-      high: 6.5
+      goal: maximize #range
+      # low: 5.0
+      # high: 6.5
     SAScore:
       goal: range
       low: 1.5

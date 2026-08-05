@@ -12,8 +12,14 @@ PropertyGuidedLMTrainer：在標準 SmilesLM 預訓練之外，額外用 REINFOR
        最好的一批分子」的名次（而不是只跟同一輪隨機抽到的分子比較，避免 reward
        尺度因為每輪抽樣組成不同而忽大忽小）
     4. 依「是否合規」+「相對於 elite_archive 的 pareto front 名次（超過
-       elite_archive_rank 一律視為最差一階）」組成單一 reward，用 REINFORCE + baseline
-       做 policy gradient 更新，並用一份凍結的 prior 模型做正則化，避免生成多樣性崩潰
+       elite_archive_rank 一律視為最差一階）」組成 reward 的相對分量；同時（若
+       reward_absolute_weight > 0）另外算一個不受 elite_archive 影響的絕對分量——把每個
+       性質的 to_objective() 距離，用「RL 開始時從 prior model 大量取樣算出、之後固定
+       不變」的平均值/標準差轉成 z-score、取 exp(-max(z,0))，多個性質再用幾何平均合併。
+       兩個分量依 reward_absolute_weight 混合成最終 reward，避免訓練中期 elite_archive
+       門檻越墊越高之後，reward 全部卡在同一個值、advantage 趨近於零的問題。用 REINFORCE
+       + baseline 做 policy gradient 更新，並用一份凍結的 prior 模型做正則化，避免生成
+       多樣性崩潰
     5. 通過結構檢查的分子會被拿去更新兩個各自獨立的池子：
        - 「動態訓練池 (dynamic_pool)」：新分子併入池子，池子滿了就對整個池子重新做
          pareto front 排序，淘汰最差的一批。這個池子會被直接同步進 train_loader 的
@@ -84,6 +90,8 @@ class PropertyGuidedLMTrainer(Trainer):
         archive_stagnation_patience_epochs: int = 3,
         archive_stagnation_watch_rank: int = 1,
         archive_prune_keep_rank: int = 1,
+        reward_absolute_weight: float = 0.0,
+        reward_normalization_num_samples: int = 5000,
         front1_log_path: Optional[str] = None,
         elite_archive_log_path: Optional[str] = None,
         supervised_training_during_rl: bool = True,
@@ -155,6 +163,22 @@ class PropertyGuidedLMTrainer(Trainer):
                 的分子清空，讓中段名次重新空出來，之後的採樣只要比目前的 rank 0 差、
                 但彼此之間仍有相對優劣，就能重新拿到有差異化的 reward，而不是全部卡在
                 同一個 reward_pass_base。
+            reward_absolute_weight: 訓練中期之後，elite_archive 門檻越墊越高，越來越多
+                分子贏不了 archive、reward 全部卡在同一個 reward_pass_base（不管實際上
+                離目標多近多遠都一樣），advantage（reward - batch 內平均）跟著趨近於零，
+                梯度訊號消失——這是純「相對歷史排名」reward 的結構性問題：門檻只會越來越
+                嚴格，不像主流 REINVENT（Olivecrona et al. 2017; Blaschke et al. 2020）
+                用的是不隨訓練漂移的絕對 desirability 分數。這個參數控制在最終 reward
+                縮放係數裡混入多少「絕對」分量（見 _compute_absolute_desirability）：
+                combined_scale = reward_absolute_weight * absolute_desirability
+                                  + (1 - reward_absolute_weight) * relative_scale
+                0.0（預設）完全維持原本「純相對 rank」行為，不影響既有訓練設定；1.0 則
+                完全不看 elite_archive 的相對名次，只看絕對分量。絕對分量的正規化基準
+                （每個性質的平均值/標準差）只在 RL 開始時從 prior model 大量取樣算一次、
+                之後固定不變，才不會重蹈相對排名「基準本身也隨訓練變嚴格」的覆轍。
+            reward_normalization_num_samples: 計算上述絕對分量正規化基準時，從 prior
+                model 取樣幾個分子來估計每個性質的平均值/標準差。只有 reward_absolute_
+                weight > 0 時才會用到（等於 0 時完全跳過這個取樣+推論步驟，省開銷）。
             front1_log_path: front 1 分子的 CSV log 路徑，預設存在 save_dir 底下
             elite_archive_log_path: 每一輪更新完 elite_archive 之後，archive 裡目前
                 pareto rank 前 5 層的分子（SMILES、各性質原始數值、rank）會整批覆蓋
@@ -204,6 +228,13 @@ class PropertyGuidedLMTrainer(Trainer):
         self._elite_archive_watch_rank_snapshot: set = set()
         self._epochs_without_watch_rank_change: int = 0
 
+        self.reward_absolute_weight = reward_absolute_weight
+        self.reward_normalization_num_samples = reward_normalization_num_samples
+        # 每個性質 to_objective() 距離的 (mean, std)，只在 RL 開始時從 prior model 取樣算
+        # 一次、之後固定不變；None 代表還沒校準，或校準樣本不足而停用（此時絕對分量視為 0）
+        self.reward_norm_mean: Optional[Dict[str, float]] = None
+        self.reward_norm_std: Optional[Dict[str, float]] = None
+
         if self.dynamic_pool_enabled and not hasattr(self.train_loader.dataset, 'set_dynamic_smiles'):
             print(
                 "⚠ train_loader.dataset 不支援 set_dynamic_smiles()，"
@@ -226,6 +257,93 @@ class PropertyGuidedLMTrainer(Trainer):
         self.prior_model.eval()
         for p in self.prior_model.parameters():
             p.requires_grad_(False)
+
+    # ------------------------------------------------------------------
+    # Reward 絕對分量：從 prior model 大量取樣，估計每個性質的正規化基準
+    # ------------------------------------------------------------------
+    def _compute_reward_normalization_stats(self):
+        """
+        從剛凍結的 prior model 大量取樣，計算每個性質 to_objective() 距離的平均值/標準差，
+        當作「這個性質在模型自然產出的分子裡本來就有多少變異」的固定基準，用來把不同單位
+        的性質正規化成可比較的 z-score（見 _compute_absolute_desirability）。只在 RL 開始
+        前算這一次，之後整個訓練過程都固定不變，不會因為 RL 讓分子越來越集中在目標附近
+        就跟著往下漂移——那樣又會重新製造一個不斷變嚴格的隱性門檻，跟這個機制原本要解決
+        的問題一樣。
+        """
+        print(f"  校準 reward 絕對分量：從 prior model 取樣 {self.reward_normalization_num_samples} 個分子...")
+        tokens = self.prior_model.sample(
+            num_samples=self.reward_normalization_num_samples,
+            max_length=self.max_length,
+            start_idx=self.tokenizer.start_idx,
+            device=self.device,
+            sampling_mode='multinomial',
+            temperature=self.sampling_temperature,
+        )
+        smiles_list = [
+            self.tokenizer.decode(tokens[i].detach().cpu().tolist()) for i in range(tokens.size(0))
+        ]
+        canonical_list = [canonicalize_smiles(s) for s in smiles_list]
+        valid_smiles = [s for s, c in zip(smiles_list, canonical_list) if c]
+        pass_smiles = self.filter_api(valid_smiles) if valid_smiles else []
+
+        min_calibration_samples = 30
+        if len(pass_smiles) < min_calibration_samples:
+            print(
+                f"  ⚠ 校準樣本不足（{len(pass_smiles)} < {min_calibration_samples}），"
+                f"reward 絕對分量停用（等同 reward_absolute_weight=0）"
+            )
+            self.reward_norm_mean = None
+            self.reward_norm_std = None
+            return
+
+        property_names = list(self.target_spec.keys())
+        prop_df = self.inference_api.inference_pipeline(pass_smiles, properties=property_names)
+
+        self.reward_norm_mean = {}
+        self.reward_norm_std = {}
+        for name in property_names:
+            spec = self.target_spec[name]
+            raw_objective = np.array([spec.to_objective(v) for v in prop_df[name].tolist()])
+            self.reward_norm_mean[name] = float(np.mean(raw_objective))
+            self.reward_norm_std[name] = float(max(np.std(raw_objective), 1e-6))
+
+        print(
+            f"  ✓ 校準完成（{len(pass_smiles)} 個合規分子）: " +
+            ", ".join(
+                f"{name}(mean={self.reward_norm_mean[name]:.3f}, std={self.reward_norm_std[name]:.3f})"
+                for name in property_names
+            )
+        )
+
+    def _compute_absolute_desirability(self, prop_df) -> np.ndarray:
+        """
+        對每個分子，用 reward_norm_mean/std（由 prior model 大量取樣算出、訓練中固定不變）
+        把每個性質的 to_objective() 距離轉成 z-score：
+            z = (to_objective(value) - mean_ref) / std_ref
+            desirability_i = exp(-max(z, 0))
+        「比 prior model 自然產出的族群平均還好」(z <= 0) 一律視為接近滿分，只有比平均差
+        的部分才開始衰減——對 range 型性質尤其重要：prior model 隨機產出的分子多數會落在
+        目標窄區間外，mean_ref 通常是正數，一個真的落在區間內的分子 (to_objective=0) 會
+        得到 z<0、被夾到 0、desirability=1，符合預期。
+
+        多個性質的 desirability 用幾何平均合併成單一絕對分數（呼應 REINVENT 官方慣例：
+        任一性質嚴重沒達標時整體分數會被拉低，不會被其他性質平均掉），回傳 (0, 1] 區間。
+
+        self.reward_norm_mean 是 None（還沒校準/校準失敗）時，直接回傳全 0（在 _score_batch
+        裡會連帶讓 effective_abs_weight 視為 0，完全退回原本的純相對 rank reward）。
+        """
+        if self.reward_norm_mean is None:
+            return np.zeros(len(prop_df))
+
+        property_names = list(self.target_spec.keys())
+        log_desirability = np.zeros(len(prop_df))
+        for name in property_names:
+            spec = self.target_spec[name]
+            raw_objective = np.array([spec.to_objective(v) for v in prop_df[name].tolist()])
+            z = (raw_objective - self.reward_norm_mean[name]) / self.reward_norm_std[name]
+            log_desirability += -np.clip(z, a_min=0, a_max=None)
+
+        return np.exp(log_desirability / len(property_names))
 
     # ------------------------------------------------------------------
     # 共用的 log-prob 工具
@@ -378,6 +496,8 @@ class PropertyGuidedLMTrainer(Trainer):
             prop_df: 只對 pass_smiles_ordered 算出的性質 DataFrame（沒有則為 None）
             front_ranks: 對應 pass_smiles_ordered、相對於 elite_archive 的 pareto front rank
                 （0 = 最好，沒有則為 None）
+            absolute_desirability: 對應 pass_smiles_ordered 的絕對分量（見
+                _compute_absolute_desirability，沒有則為 None）
         """
         rewards = np.full(len(smiles_list), self.reward_invalid, dtype=np.float64)
 
@@ -386,7 +506,7 @@ class PropertyGuidedLMTrainer(Trainer):
         valid_smiles = [smiles_list[i] for i in valid_indices]
 
         if not valid_smiles:
-            return rewards, [], None, None, None
+            return rewards, [], None, None, None, None
 
         pass_set = set(self.filter_api(valid_smiles))
 
@@ -400,7 +520,7 @@ class PropertyGuidedLMTrainer(Trainer):
                 rewards[i] = self.reward_structure_fail
 
         if not pass_smiles_ordered:
-            return rewards, [], None, None, None
+            return rewards, [], None, None, None, None
 
         property_names = list(self.target_spec.keys())
         prop_df = self.inference_api.inference_pipeline(pass_smiles_ordered, properties=property_names)
@@ -411,6 +531,9 @@ class PropertyGuidedLMTrainer(Trainer):
             objective_matrix[:, col_idx] = [spec.to_objective(v) for v in prop_df[name].tolist()]
 
         front_ranks = self._rank_against_elite_archive(pass_smiles_ordered, objective_matrix)
+        absolute_desirability = self._compute_absolute_desirability(prop_df)
+        # reward_norm_mean 還沒校準（校準樣本不足）時，絕對分量停用，完全退回純相對 rank
+        effective_abs_weight = self.reward_absolute_weight if self.reward_norm_mean is not None else 0.0
 
         # 用固定的 elite_archive_rank 當名次縮放的分母上限，而不是這一輪實際的 max_front：
         # 一來這一輪的 max_front 會因為抽樣組成不同而忽大忽小，讓 reward 尺度不穩定；
@@ -423,10 +546,16 @@ class PropertyGuidedLMTrainer(Trainer):
             linear_scale = 1.0 - (capped_rank / (top_k - 1)) if top_k > 1 else 1.0
             # power=1.0 時等於原本的線性縮放；power 越大，前幾名之間的 reward 差距
             # 會被放大，後段名次則彼此更接近（曲線仍平滑遞減到 reward_pass_base）
-            scale = linear_scale ** self.reward_scale_power
-            rewards[global_idx] = self.reward_pass_base + (self.reward_pass_max - self.reward_pass_base) * scale
+            relative_scale = linear_scale ** self.reward_scale_power
+            # 絕對分量（見 _compute_absolute_desirability）不受 elite_archive 門檻影響，
+            # 提供不隨訓練漂移的差異化訊號；跟相對分量依 reward_absolute_weight 混合
+            combined_scale = (
+                effective_abs_weight * absolute_desirability[local_idx]
+                + (1 - effective_abs_weight) * relative_scale
+            )
+            rewards[global_idx] = self.reward_pass_base + (self.reward_pass_max - self.reward_pass_base) * combined_scale
 
-        return rewards, pass_smiles_ordered, objective_matrix, prop_df, front_ranks
+        return rewards, pass_smiles_ordered, objective_matrix, prop_df, front_ranks, absolute_desirability
 
     # ------------------------------------------------------------------
     # Front 1 監看用的 log
@@ -509,7 +638,8 @@ class PropertyGuidedLMTrainer(Trainer):
             for i in range(tokens.size(0))
         ]
 
-        rewards, pass_smiles_ordered, objective_matrix, prop_df, front_ranks = self._score_batch(smiles_list)
+        rewards, pass_smiles_ordered, objective_matrix, prop_df, front_ranks, absolute_desirability = \
+            self._score_batch(smiles_list)
         front1_rows = self._log_front1_molecules(epoch, round_idx, pass_smiles_ordered, prop_df, front_ranks)
         self._update_dynamic_pool(pass_smiles_ordered, objective_matrix)
         # 在算完這一輪的 reward 之後才更新 archive，這樣這一輪的分子才是跟「更新前」的
@@ -548,6 +678,10 @@ class PropertyGuidedLMTrainer(Trainer):
             if front_ranks is not None and len(front_ranks) > 0
             else [0, 0, 0, 0, 0]
         )
+        mean_absolute_desirability = (
+            float(absolute_desirability.mean()) if absolute_desirability is not None and len(absolute_desirability) > 0
+            else 0.0
+        )
 
         metrics = {
             'epoch': epoch,
@@ -561,6 +695,7 @@ class PropertyGuidedLMTrainer(Trainer):
             'dynamic_pool_size': len(self.dynamic_pool),
             'elite_archive_size': len(self.elite_archive),
             'mean_reward': float(rewards_t.mean().item()),
+            'mean_absolute_desirability': mean_absolute_desirability,
             'loss_pg': float(loss_pg.item()),
             'loss_prior': float(loss_prior.item()),
             'loss_rl': float(loss_rl.item()),
@@ -614,6 +749,8 @@ class PropertyGuidedLMTrainer(Trainer):
             if epoch == self.warmup_epochs + 1:
                 print(f"\n>>> Warmup 結束，snapshot 目前模型當作 RL 的 prior <<<")
                 self._snapshot_prior()
+                if self.reward_absolute_weight > 0:
+                    self._compute_reward_normalization_stats()
 
             if epoch > self.warmup_epochs:
                 for round_idx in range(self.num_rl_rounds_per_epoch):
@@ -628,6 +765,7 @@ class PropertyGuidedLMTrainer(Trainer):
                         f"dynamic_pool={rl_metrics['dynamic_pool_size']} "
                         f"elite_archive={rl_metrics['elite_archive_size']} "
                         f"mean_reward={rl_metrics['mean_reward']:.4f} "
+                        f"abs_desirability={rl_metrics['mean_absolute_desirability']:.4f} "
                         f"loss_pg={rl_metrics['loss_pg']:.4f} loss_prior={rl_metrics['loss_prior']:.4f}"
                     )
                     if rl_metrics['front1_rows']:

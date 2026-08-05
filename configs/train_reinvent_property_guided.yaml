@@ -85,6 +85,20 @@ property_guided:
   # 的 reward 差距、壓縮後段名次的差距（見 train_reinvent_property_guided.yaml 完整說明）
   reward_scale_power: 2.0
 
+  # 訓練中期之後 elite_archive 門檻越墊越高，越來越多分子贏不了 archive、reward 全部卡在
+  # 同一個 reward_pass_base（不管實際上離目標多近多遠都一樣），advantage 趨近於零、梯度
+  # 訊號消失——這是純「相對歷史排名」reward 的結構性問題。reward_absolute_weight 控制
+  # 混入多少「絕對」分量：把每個性質的 to_objective() 距離，用 RL 開始時從 prior model
+  # 大量取樣算出、之後固定不變的平均值/標準差轉成 z-score（z = (raw - mean_ref) / std_ref，
+  # 只有比 prior model 自然產出的族群平均差的部分才開始衰減），取
+  # exp(-max(z,0))，多個性質再用幾何平均合併成單一絕對分數，不受 elite_archive 狀態影響。
+  # combined_scale = reward_absolute_weight * absolute_desirability + (1 - reward_absolute_weight) * relative_scale
+  # 這裡先設 1.0：完全不看 elite_archive 的相對名次，只看絕對分量，方便先單獨驗證這個新
+  # 機制本身的效果，之後可以視情況調回混合（0.0 = 原本純相對排名的行為）
+  reward_absolute_weight: 1.0
+  # 校準 reward_absolute_weight 用的平均值/標準差時，從 prior model 取樣幾個分子
+  reward_normalization_num_samples: 5000
+
   # 連續幾個 epoch archive 的第 archive_stagnation_watch_rank 層（預設 rank 1，也就是
   # 「front 2」）都沒變化就視為停滯，觸發清理：把 archive 清到只剩
   # rank < archive_prune_keep_rank 的分子（見 train_reinvent_property_guided.yaml
