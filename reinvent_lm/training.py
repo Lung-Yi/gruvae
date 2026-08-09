@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 import random
 
 from .tokenizer import SmilesTokenizer
-from .dataset import SmilesLMDataset, DynamicSmilesLMDataset, collate_fn
+from .dataset import SmilesLMDataset, collate_fn
 from .models.lm import SmilesLM
 from .seed_utils import set_seed, seed_worker
 from rdkit import Chem
@@ -279,10 +279,10 @@ def main(config_path='configs/train_reinvent.yaml'):
         shuffled_smiles = filtered_smiles_list[:]
         random.shuffle(shuffled_smiles)
         train_size = int(train_split * len(shuffled_smiles))
-        train_dataset = DynamicSmilesLMDataset(
-            shuffled_smiles[:train_size], randomize=randomize_training_smiles, seed=seed
+        train_dataset = SmilesLMDataset(
+            smiles_list=shuffled_smiles[:train_size], randomize=randomize_training_smiles, seed=seed
         )
-        val_dataset = DynamicSmilesLMDataset(shuffled_smiles[train_size:], randomize=False, seed=seed)
+        val_dataset = SmilesLMDataset(smiles_list=shuffled_smiles[train_size:], randomize=False, seed=seed)
     else:
         # 直接切 smiles list 分別建兩個 Dataset（而不是用 random_split 包同一個 Dataset 實例），
         # 這樣訓練集/驗證集才能各自套用不同的 randomize 設定
@@ -299,10 +299,11 @@ def main(config_path='configs/train_reinvent.yaml'):
     batch_size = config['training']['batch_size']
     num_workers = config['training']['num_workers']
 
-    # persistent_workers 明確鎖在 False：RL 動態訓練池（DynamicSmilesLMDataset.set_dynamic_smiles）
-    # 會在 epoch 之間直接改動 Dataset 物件的內容，若 worker 跨 epoch 存活（persistent_workers=True），
-    # 已經 fork 出去的 worker 會看不到這個更新，動態池同步會被悄悄破壞；False（預設行為）時每個
-    # epoch 重新 fork worker，才能保證看到 main process 最新的 dataset 狀態。
+    # persistent_workers 明確鎖在 False：train_epoch() 每個 epoch 開始都會呼叫
+    # dataset.set_epoch(epoch) 讓 per-item 的隨機化 seed 隨 epoch 改變（見 dataset.py），
+    # 若 worker 跨 epoch 存活（persistent_workers=True），已經 fork 出去的 worker 會拿著
+    # 自己那份 Dataset 物件複本、看不到 main process 更新的 _epoch；False（預設行為）時
+    # 每個 epoch 重新 fork worker，才能保證看到最新的 _epoch。
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -405,8 +406,6 @@ def build_property_guided_trainer(common_trainer_kwargs: dict, pg_config: dict, 
             high=spec_config.get('high'),
         )
 
-    dynamic_pool_config = pg_config.get('dynamic_training_data', {})
-
     return PropertyGuidedLMTrainer(
         **common_trainer_kwargs,
         filter_api=filter_api,
@@ -422,16 +421,8 @@ def build_property_guided_trainer(common_trainer_kwargs: dict, pg_config: dict, 
         reward_pass_max=pg_config.get('reward_pass_max', 1.0),
         prior_kl_weight=pg_config.get('prior_kl_weight', 0.1),
         sampling_temperature=pg_config.get('sampling_temperature', 1.0),
-        dynamic_pool_enabled=dynamic_pool_config.get('enabled', True),
-        dynamic_pool_max_size=dynamic_pool_config.get('max_pool_size', 500),
         elite_archive_rank=pg_config.get('elite_archive_rank', 5),
-        reward_scale_power=pg_config.get('reward_scale_power', 1.0),
-        archive_stagnation_patience_epochs=pg_config.get('archive_stagnation_patience_epochs', 3),
-        archive_stagnation_watch_rank=pg_config.get('archive_stagnation_watch_rank', 1),
-        archive_prune_keep_rank=pg_config.get('archive_prune_keep_rank', 1),
-        reward_absolute_weight=pg_config.get('reward_absolute_weight', 0.0),
         reward_normalization_num_samples=pg_config.get('reward_normalization_num_samples', 5000),
         front1_log_path=pg_config.get('front1_log_path'),
         elite_archive_log_path=pg_config.get('elite_archive_log_path'),
-        supervised_training_during_rl=pg_config.get('supervised_training_during_rl', True),
     )

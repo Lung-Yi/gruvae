@@ -3,11 +3,15 @@
 #
 # 開啟 property_guided.enabled 後：
 #   1. 訓練資料在一開始就會先用 filter_api 過濾過，只保留符合結構規則的 SMILES
-#   2. warmup 結束後每個 epoch 會額外用目前的模型採樣一批分子（從 BOS 開始自回歸生成），
-#      依「結構規則(filter_api)」+「性質目標(target_spec) 的 pareto front 排序」算 reward，
-#      做 REINFORCE 微調
-#   3. 通過結構規則的分子會被拿去更新一個動態訓練池，直接同步進實際的訓練資料
-#   4. 每一輪 front 1（最好的一層）的分子結構與性質會寫進 property_guided.front1_log_path
+#   2. 前 warmup_epochs 個 epoch 做原本的監督式訓練；warmup 結束後就完全只靠 RL 微調，
+#      不再穿插任何監督式訓練
+#   3. warmup 結束後每個 epoch 會額外用目前的模型採樣一批分子（從 BOS 開始自回歸生成），
+#      依「結構規則(filter_api)」+「性質目標(target_spec) 的絕對 desirability」算 reward，
+#      做 REINFORCE 微調（reward 完全是絕對分數，不看任何排名/歷史比較）
+#   4. 通過結構規則的分子仍會被拿去更新一個「菁英 archive」，但這個 archive 純粹是事後
+#      分析用的歷史紀錄（找出這個生成器最終發現哪些好分子），不影響 reward 或訓練本身；
+#      每一輪 front 1（archive 內最好的一層）的分子結構與性質會寫進
+#      property_guided.front1_log_path
 
 # 資料設定
 data:
@@ -15,7 +19,7 @@ data:
   train_split: 0.9
   max_length: 50
   # 訓練時是否每次取用都用 RDKit 重新隨機化 SMILES 書寫法 (SMILES enumeration)，
-  # 對監督式訓練那部分的資料（含動態訓練池）有效；驗證集固定用 canonical 寫法
+  # 對監督式訓練（warmup）那部分的資料有效；驗證集固定用 canonical 寫法
   randomize_smiles: true
 
 # 模型架構
@@ -68,32 +72,26 @@ property_guided:
   num_samples_per_round: 1024
   num_rl_rounds_per_epoch: 20
 
-  # 前幾個 epoch 只做原本的監督式訓練，之後才開始 RL 微調
+  # 前幾個 epoch 只做原本的監督式訓練，之後才開始 RL 微調；warmup 結束後就完全只靠
+  # RL（loss_pg + prior 正則化）更新模型，不再穿插任何監督式訓練——跟 REINVENT 原版
+  # （Olivecrona et al. 2017）Agent 微調階段的做法一致
   warmup_epochs: 5
 
-  # warmup 結束、RL 開始之後，是否每個 epoch 仍要做一次監督式訓練（詳見
-  # train_reinvent_property_guided.yaml 的註解）
-  supervised_training_during_rl: false
-
-  # 菁英 archive 保留 pareto rank 前幾層（不是固定數量）的分子：每輪 reward 計算時，
-  # 會把通過結構檢查的分子跟這個 archive 目前保留的分子合併做 pareto 排序，用「相對於
-  # 歷史最佳前緣」的名次算 reward（見 train_reinvent_property_guided.yaml 的完整說明），
-  # 而不是只跟同一輪隨機抽到的分子比較
+  # 「菁英 archive」保留 pareto rank 前幾層（不是固定數量）的分子：每輪把通過結構檢查
+  # 的分子跟這個 archive 目前保留的分子合併做一次 pareto 排序，更新 archive 內容。
+  # 這個 archive 純粹是事後分析用的歷史紀錄（讓你知道這個生成器最終找到哪些好分子，
+  # 見 elite_archive_log_path），完全不影響 reward 或訓練本身
   elite_archive_rank: 50
 
-  # reward 名次縮放曲線的指數，1.0 是線性（每階名次差距固定）。調大會放大前幾名之間
-  # 的 reward 差距、壓縮後段名次的差距（見 train_reinvent_property_guided.yaml 完整說明）
-  reward_scale_power: 1.5
+  # Reward 完全由「絕對 desirability」決定：把每個性質的 to_objective() 距離，用 RL
+  # 開始時從 prior model 大量取樣算出、之後固定不變的平均值/標準差轉成 z-score
+  # （z = (raw - mean_ref) / std_ref，只有比 prior model 自然產出的族群平均差的部分才
+  # 開始衰減），取 exp(-max(z,0))，多個性質再用幾何平均合併成單一絕對分數（0~1）。
+  # reward = reward_pass_base + (reward_pass_max - reward_pass_base) * absolute_desirability
+  # 校準這個正規化基準（平均值/標準差）時，從 prior model 取樣幾個分子
+  reward_normalization_num_samples: 5000
 
-  # 連續幾個 epoch archive 的第 archive_stagnation_watch_rank 層（預設 rank 1，也就是
-  # 「front 2」）都沒變化就視為停滯，觸發清理：把 archive 清到只剩
-  # rank < archive_prune_keep_rank 的分子（見 train_reinvent_property_guided.yaml
-  # 完整說明），讓中段名次重新空出來競爭
-  archive_stagnation_patience_epochs: 100
-  archive_stagnation_watch_rank: 10
-  archive_prune_keep_rank: 10
-
-  # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且 pareto front 最好
+  # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且絕對 desirability 最好
   reward_invalid: -2.0
   reward_structure_fail: -1.0
   reward_pass_base: 1.0
@@ -129,11 +127,6 @@ property_guided:
       goal: range
       low: 300
       high: 470
-
-  # 動態訓練資料：把「持續勝出」的合規分子直接同步進實際的訓練資料集
-  dynamic_training_data:
-    enabled: false
-    max_pool_size: 10000
 
   # Front 1 分子的 CSV log 路徑，不填則預設存在 checkpoint.save_dir 底下的 front1_log.csv
   front1_log_path: null

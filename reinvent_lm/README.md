@@ -112,7 +112,7 @@ reinvent_lm/
         __init__.py
         sampling.py     # sample_next_token：greedy / multinomial 取樣共用工具
         lm.py           # SmilesLM：GRU decoder-only 語言模型本體
-    dataset.py          # SmilesLMDataset / DynamicSmilesLMDataset / collate_fn
+    dataset.py          # SmilesLMDataset / collate_fn
     training.py         # Trainer（純預訓練）+ main()：讀 YAML、組裝各元件、啟動訓練
     rl_trainer.py       # PropertyGuidedLMTrainer(Trainer)：REINFORCE 多目標 RL 微調
     generation.py       # MoleculeGenerator：訓練完之後方便使用的生成/探索介面
@@ -144,7 +144,7 @@ flowchart TD
 
     MAIN --> LOADCFG["load_config()\n讀 YAML"]
     MAIN --> TOK["SmilesTokenizer\nload_from 有值 -> load()\n否則 -> build_vocab()"]
-    MAIN --> DS["SmilesLMDataset /\nDynamicSmilesLMDataset\n(train/val 各自不同 randomize 設定)"]
+    MAIN --> DS["SmilesLMDataset\n(train/val 各自不同 randomize 設定)"]
     DS --> DL["DataLoader\n(collate_fn 綁定 tokenizer)"]
     MAIN --> MODEL["SmilesLM\n建立 + (可選) load_from 權重"]
 
@@ -158,22 +158,19 @@ flowchart TD
     BPT --> PS["PropertySpec\n(每個 target_spec 性質各一個)"]
     BPT --> PGT["PropertyGuidedLMTrainer\n(繼承 Trainer)"]
 
-    PGT --> LOOP2["trainer.train(num_epochs)\n每 epoch: train_epoch() + validate()\n+ warmup 後每輪 run_rl_round()\n+ 每 epoch 結束後停滯偵測"]
+    PGT --> LOOP2["trainer.train(num_epochs)\nwarmup 期間: train_epoch() + validate()\nwarmup 結束後: 只跑 validate() + run_rl_round()"]
     LOOP2 --> RL["run_rl_round()"]
     RL --> S1["model.sample() 自回歸取樣"]
-    RL --> S2["_score_batch()\n合法性 -> filter_api -> inference_api\n-> 跟 elite_archive 合併排序"]
+    RL --> S2["_score_batch()\n合法性 -> filter_api -> inference_api\n-> _compute_absolute_desirability() 決定 reward"]
     S2 --> SF
     S2 --> PIA
-    S2 --> S2B["_rank_against_elite_archive()"]
+    S2 --> S2N["_compute_absolute_desirability()\n(reward 唯一來源，z-score + 幾何平均)"]
+    S2 --> S2B["_rank_against_elite_archive()\n(純分析記錄，不影響 reward)"]
     S2B --> PARETO["pareto.assign_pareto_fronts()"]
     RL --> S3["REINFORCE + baseline\n(_sequence_log_prob 對 prior_model 做正則化)"]
-    RL --> S4["_update_dynamic_pool()\n同步進 DynamicSmilesLMDataset"]
-    S4 -.->|"下個 epoch 監督式訓練會用到"| DS
-    RL --> S5["_update_elite_archive()\n只保留 rank < elite_archive_rank"]
+    RL --> S5["_update_elite_archive()\n只保留 rank < elite_archive_rank\n(純分析用歷史紀錄)"]
     S5 --> PARETO
     RL --> S6["_log_elite_archive_snapshot()\n覆蓋寫入 elite_archive_log_path"]
-    LOOP2 --> S7["_check_and_prune_elite_archive_on_stagnation()\n每個 epoch 結束後執行一次"]
-    S7 --> PARETO
 
     subgraph INFER["推論階段（訓練結束後，獨立呼叫）"]
         GEN["MoleculeGenerator(tokenizer_path, config_path, checkpoint_path)"]
@@ -225,15 +222,6 @@ classDiagram
         __getitem__(idx) str
     }
 
-    class DynamicSmilesLMDataset {
-        <<Dataset>>
-        +base_smiles : List~str~
-        +dynamic_smiles : List~str~
-        +randomize : bool
-        +set_dynamic_smiles(smiles_list)
-        __getitem__(idx) str
-    }
-
     class PropertySpec {
         +goal : str
         +low / high : float
@@ -276,15 +264,16 @@ classDiagram
         +inference_api : PropertyInferenceAPI
         +target_spec : Dict~PropertySpec~
         +prior_model : SmilesLM
-        +dynamic_pool : Dict
         +elite_archive : Dict
+        +reward_norm_mean / reward_norm_std : Dict
         +_snapshot_prior()
+        +_compute_reward_normalization_stats()
+        +_compute_absolute_desirability(prop_df) desirability
         +_generation_mask(tokens) mask
         +_sequence_log_prob(model, tokens, mask) logp
         +_score_batch(smiles_list) rewards
         +_rank_against_elite_archive(smiles, obj) ranks
         +_update_elite_archive(smiles, obj, prop_df)
-        +_check_and_prune_elite_archive_on_stagnation()
         +run_rl_round(epoch, round_idx) metrics
         +train(num_epochs)
     }
@@ -292,9 +281,8 @@ classDiagram
     PropertyGuidedLMTrainer o-- StructureFilter : filter_api
     PropertyGuidedLMTrainer *-- PropertyInferenceAPI : inference_api
     PropertyGuidedLMTrainer o-- PropertySpec : target_spec
-    PropertyGuidedLMTrainer ..> assign_pareto_fronts : _score_batch()/_update_elite_archive() 內呼叫
+    PropertyGuidedLMTrainer ..> assign_pareto_fronts : _rank_against_elite_archive()/_update_elite_archive() 內呼叫（分析用）
     PropertyGuidedLMTrainer o-- SmilesLM : prior_model（凍結 snapshot）
-    PropertyGuidedLMTrainer o-- DynamicSmilesLMDataset : train_loader.dataset (set_dynamic_smiles)
 
     class MoleculeGenerator {
         +tokenizer : SmilesTokenizer
@@ -453,23 +441,17 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 
 | 欄位 | 預設值 | 說明 |
 |---|---|---|
-| `enabled` | — | 是否啟用 RL 微調模式。啟用後訓練資料會**先過濾成只含合規 SMILES**，並改用支援動態增減的 `DynamicSmilesLMDataset` |
+| `enabled` | — | 是否啟用 RL 微調模式。啟用後訓練資料會**先過濾成只含合規 SMILES** |
 | `max_length` | 沿用 `data.max_length` | RL 取樣生成分子時的最大長度 |
 | `num_samples_per_round` | 256 | 每個 RL round 取樣幾個分子來算 reward、更新一次模型 |
-| `num_rl_rounds_per_epoch` | 1 | 每個 epoch（做完監督式訓練後）跑幾個 RL round |
-| `warmup_epochs` | 5 | 前幾個 epoch 只做監督式訓練（不啟動 RL），讓模型先把基本語法學好；warmup 結束那一刻（`epoch == warmup_epochs + 1`）會把當時的模型 snapshot 下來當作 RL 的 **prior**（之後永遠不會再更新，見下節說明） |
-| `supervised_training_during_rl` | true | warmup 結束、RL 開始之後，是否每個 epoch 仍要做一次監督式訓練（`train_epoch`）。設 `false` 時 warmup 結束後只靠 RL（`loss_pg` + prior 正則化）更新模型，不再穿插監督式訓練，跟 REINVENT 原版 Agent 微調階段的做法一致；不影響 warmup 期間（warmup 本身就是監督式訓練）。設 `false` 時動態訓練池仍會照常累積，但不會再被拿去訓練，可視情況一併關掉 `dynamic_training_data.enabled` |
+| `num_rl_rounds_per_epoch` | 1 | 每個 epoch（warmup 結束後）跑幾個 RL round |
+| `warmup_epochs` | 5 | 前幾個 epoch 只做監督式訓練（不啟動 RL），讓模型先把基本語法學好；warmup 結束那一刻（`epoch == warmup_epochs + 1`）會把當時的模型 snapshot 下來當作 RL 的 **prior**（之後永遠不會再更新，見下節說明），同時校準絕對 reward 的正規化基準。warmup 結束後就完全只靠 RL 更新模型，不再穿插任何監督式訓練，跟 REINVENT 原版 Agent 微調階段的做法一致 |
 | `reward_invalid` | -1.0 | RDKit 無法解析的分子的 reward |
 | `reward_structure_fail` | -0.5 | 合法但沒通過 `structure_filter` 的分子的 reward |
-| `reward_pass_base` | 0.0 | 通過結構檢查、但相對於 `elite_archive` 的 pareto rank 最差（超過 `elite_archive_rank`）的分子的 reward |
-| `reward_pass_max` | 1.0 | 通過結構檢查、且相對於 `elite_archive` 的 pareto rank 最好（rank 0）的分子的 reward |
-| `elite_archive_rank` | 5 | 「菁英 archive」保留 pareto rank 0 ~ (`elite_archive_rank`-1) 的**所有**分子（依名次篩選，不是固定數量），同時也是 reward 名次縮放的分母上限，細節見下節「Elite Archive」 |
-| `reward_scale_power` | 1.0 | reward 名次縮放曲線的指數，`scale = (1 - rank/(elite_archive_rank-1)) ** reward_scale_power`。預設 1.0 是線性；調大（例如 2、3）會放大前幾名之間的 reward 差距、壓縮後段名次的差距 |
-| `reward_absolute_weight` | 0.0 | 混入多少「絕對」reward 分量（`0~1`），細節見下節「Reward 的絕對分量」。`0.0` 完全維持純相對 rank 行為 |
-| `reward_normalization_num_samples` | 5000 | 校準絕對分量正規化基準時，從 prior model 取樣幾個分子（只有 `reward_absolute_weight > 0` 時才用得到） |
-| `archive_stagnation_patience_epochs` | 3 | 連續幾個 epoch，`elite_archive` 的第 `archive_stagnation_watch_rank` 層成員完全沒有變化就視為訓練停滯，觸發一次 archive 清理 |
-| `archive_stagnation_watch_rank` | 1 | 停滯偵測要盯著看的 pareto rank（0-indexed，`1` = 你平常講的「front 2」）。不盯 rank 0 是因為 rank 0 本來就最難改善，長期不變是正常現象 |
-| `archive_prune_keep_rank` | 1 | 觸發停滯清理時，`elite_archive` 只保留 `rank < archive_prune_keep_rank` 的分子，其餘全部清掉，讓中段名次重新空出來競爭 |
+| `reward_pass_base` | 0.0 | 通過結構檢查、但絕對 desirability 最差（接近 0）的分子的 reward |
+| `reward_pass_max` | 1.0 | 通過結構檢查、且絕對 desirability 最好（接近 1）的分子的 reward |
+| `elite_archive_rank` | 5 | 「菁英 archive」保留 pareto rank 0 ~ (`elite_archive_rank`-1) 的**所有**分子（依名次篩選，不是固定數量）。這個 archive 純粹是事後分析用的歷史紀錄，不影響 reward，細節見下節「Elite Archive」 |
+| `reward_normalization_num_samples` | 5000 | 校準絕對 reward 正規化基準時，從 prior model 取樣幾個分子，細節見下節「Reward：絕對 desirability」 |
 | `prior_kl_weight` | 0.1 | 對凍結 prior 做正則化的權重，防止 RL 微調時生成多樣性崩潰（mode collapse），細節見下節 |
 | `sampling_temperature` | 1.0 | RL 取樣（multinomial）時的溫度，越高越隨機/多樣 |
 | `structure_filter.max_ring_size` | 8 | 環大小上限 |
@@ -480,9 +462,7 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 | `structure_filter.require_all_desired` | true | `desired_smarts` 要全部符合(true)還是符合一個就好(false) |
 | `target_spec.<性質名>.goal` | — | `maximize` / `minimize` / `range`，見下方 `PropertySpec` 說明 |
 | `target_spec.<性質名>.low/high` | — | `goal: range` 時必填的區間 |
-| `dynamic_training_data.enabled` | true | 是否把合規分子動態同步進訓練資料 |
-| `dynamic_training_data.max_pool_size` | 500 | 動態訓練池最多保留幾個分子 |
-| `front1_log_path` | `<save_dir>/front1_log.csv` | 每輪 front 1（相對於 `elite_archive` 的 rank 0）分子的 CSV log 路徑（累積 append） |
+| `front1_log_path` | `<save_dir>/front1_log.csv` | 每輪 front 1（相對於 `elite_archive` 的 rank 0）分子的 CSV log 路徑（累積 append，純分析用） |
 | `elite_archive_log_path` | `<save_dir>/elite_archive_log.csv` | `elite_archive` 目前保留的全部分子快照，每輪更新完就覆蓋寫入一次（不留存歷史） |
 
 `target_spec` 支援的性質名稱由 `PropertyInferenceAPI` 決定，內建 `ClogP` / `SAScore` /
@@ -497,14 +477,10 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 `PropertyGuidedLMTrainer`（`rl_trainer.py`）繼承 `Trainer`，複用預訓練的
 `train_epoch`/`validate`/`save_checkpoint`，只在 `train()` 的 epoch 迴圈中，
 warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更新回合。warmup 期間
-（`epoch <= warmup_epochs`）一定會做監督式訓練；warmup 結束後預設仍會繼續做監督式訓練，
-但可以用 `supervised_training_during_rl: false` 關掉，讓 RL 開始之後完全只靠
-`loss_pg` + prior 正則化更新模型（跟 REINVENT 原版 Agent 微調階段一致）——這麼做的理由是：
-`prior_kl_weight` 正則化本身已經承擔了「別離原始化學空間太遠」的角色，跟監督式訓練
-防止 mode collapse 的功能有重疊，兩者同時對模型施力方向不一定一致，關掉監督式訓練
-可以讓 RL 的梯度訊號更乾淨、不被稀釋，但也少了監督式訓練「拉回」多樣性的效果，
-建議搭配追蹤生成分子的多樣性（而不只是 `mean_reward`/`pass_filter`）來判斷是否適合
-你的情境。
+（`epoch <= warmup_epochs`）一定會做監督式訓練；warmup 結束後就完全只靠 RL
+（`loss_pg` + prior 正則化）更新模型，永遠不再穿插任何監督式訓練——跟 REINVENT 原版
+Agent 微調階段的做法一致：`prior_kl_weight` 正則化已經承擔了「別離原始化學空間太遠」的
+角色，RL 開始後不再需要監督式訓練幫忙拉住多樣性。
 
 ### 一個 RL round 的完整流程（`run_rl_round`）
 
@@ -515,15 +491,12 @@ warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更�
    - 合法但沒通過 `filter_api` → reward = `reward_structure_fail`
    - 合法且通過 `filter_api` → 用 `inference_api` 算出 `target_spec` 指定的性質，
      把每個性質轉成「越小越好」的目標值（`PropertySpec.to_objective`：`maximize` 取負、
-     `minimize` 不變、`range` 取超出區間的距離、區間內為 0），再跟 `elite_archive`
-     （見下方「Elite Archive：跨輪穩定的 reward 比較基準」）合併做一次
-     `assign_pareto_fronts`（向量化的 non-dominated sorting），取得「相對於歷史最佳
-     前緣」的 pareto rank（而不是只跟同一輪隨機抽到的分子比較）。reward 依
-     `capped_rank = min(rank, elite_archive_rank-1)` 用
-     `scale = (1 - capped_rank/(elite_archive_rank-1)) ** reward_scale_power` 在
-     `[reward_pass_base, reward_pass_max]` 之間內插（rank 0 最好，拿
-     `reward_pass_max`；名次超過 `elite_archive_rank` 一律視為打平，只拿
-     `reward_pass_base`）。
+     `minimize` 不變、`range` 取超出區間的距離、區間內為 0），再算出**絕對 desirability**
+     （`_compute_absolute_desirability`，細節見下方「Reward：絕對 desirability」小節），
+     reward = `reward_pass_base + (reward_pass_max - reward_pass_base) * absolute_desirability`。
+     這個 reward 完全是絕對分數，不看任何排名或歷史比較。合規分子同時也會被拿去更新
+     `elite_archive`（見下方「Elite Archive」小節），但那**只是事後分析用的歷史紀錄**，
+     不影響這裡算出來的 reward。
 3. **REINFORCE + baseline**：
    - `advantage = reward - batch 內 reward 的平均值`（batch-mean baseline，數學上不偏，
      只是拿來降低梯度估計的變異數）
@@ -542,157 +515,88 @@ warmup 結束後每個 epoch 額外插入 `num_rl_rounds_per_epoch` 次 RL 更�
      定義成新標準，等於每一輪都對上一輪的漂移蓋章認證，長期下來可能累積出監控不出來的
      緩慢崩潰（每一步的 `loss_prior` 看起來都很小很健康，但整體已經跑到很遠的地方）。
      固定 prior 才是「整個訓練過程的總帳」，這也是 REINVENT 系列論文的做法。
-5. **更新動態訓練池**（`_update_dynamic_pool`，`dynamic_training_data.enabled=true` 時）：
-   - 這一輪通過結構檢查的分子（連同它們的性質目標值）併入一個
-     `canonical_smiles -> {smiles, objective}` 的池子；同一個分子重複出現時只留比較好的
-     那筆紀錄。
-   - 池子超過 `max_pool_size` 時，對**整個池子**重新做一次 pareto front 排序，只保留
-     排名最好的 `max_pool_size` 個（同一層 front 內不細分優劣，用穩定排序保留原順序）。
-   - 最後把池子目前的內容整批同步進 `train_loader.dataset`（`DynamicSmilesLMDataset`
-     的 `set_dynamic_smiles()`），下一個 epoch 的監督式訓練就會用到這些「持續勝出」的
-     分子——這是讓「訓練資料本身隨訓練過程改變」的機制。
-   - 這個機制要求 `train_loader.dataset` 支援 `set_dynamic_smiles()`；不支援的話會自動
-     停用並印警告。
-6. **Front 1 監看 log**（`_log_front1_molecules`）：每一輪相對於 `elite_archive` 的
+5. **Front 1 監看 log**（`_log_front1_molecules`）：每一輪相對於 `elite_archive` 的
    pareto rank 為 0（最好的一層）的分子，會印出來並累積寫進 `front1_log_path` 這個 CSV
-   （欄位：`epoch, round, smiles, <性質1>, <性質2>, ...`），方便訓練過程中打開監看進度。
-7. **更新 Elite Archive**（`_update_elite_archive`）與寫入快照（`_log_elite_archive_snapshot`）：
-   細節見下方獨立小節。
-8. **停滯偵測與清理**（`_check_and_prune_elite_archive_on_stagnation`，每個 epoch 結束後
-   跑一次）：細節見下方獨立小節。
+   （欄位：`epoch, round, smiles, <性質1>, <性質2>, ...`），方便訓練過程中/事後打開監看
+   這個生成器找到哪些好分子。
+6. **更新 Elite Archive**（`_update_elite_archive`）與寫入快照（`_log_elite_archive_snapshot`）：
+   細節見下方獨立小節。**這兩步都只是紀錄，不影響上面第 2 步已經算好的 reward。**
 
-### Elite Archive：跨輪穩定的 reward 比較基準
+### Reward：絕對 desirability
 
-早期版本的 `_score_batch` 只對「這一輪剛採樣出來的分子」彼此做 pareto 排序，這在訓練
-後期會有兩個問題：(1) 每一輪的 max front 數會因為抽樣組成不同而忽大忽小，reward 尺度
-跟著不穩定；(2) 只跟同一輪隨機抽到的分子比較，沒辦法反映「有沒有比歷史最好的分子更好」。
-
-`elite_archive` 是一個獨立於 `dynamic_pool` 的小型 buffer（`canonical_smiles ->
-{smiles, objective, properties}`），**只用來當 reward 的比較基準，不會被拿去訓練模型**：
-
-- **評分時**（`_rank_against_elite_archive`）：把這一輪通過結構檢查的分子跟 archive
-  目前的成員合併，一起做一次 pareto front 排序，只取「這一輪分子」對應的名次——這個
-  名次是相對於「目前為止看過最好的一批分子」，不是只跟同一輪的分子比較。archive 是空的
-  （訓練剛開始）時，會自然退化成單純對這一輪分子排序。
-- **更新時**（`_update_elite_archive`，每輪結束後執行）：新分子併入 archive，全部重新
-  排序，**只保留 `rank < elite_archive_rank` 的所有分子**——是依 pareto rank 篩選，
-  不是固定數量，同一層裡不管有幾個分子都會全部留著。
-  > ⚠️ 注意：因為是依 rank 篩選，如果同一個 rank 內同時有很多分子打平（例如多個
-  > `range` 型性質都達標、在該維度上都壓到同一個最低目標值 0），archive 大小可能會
-  >持續成長、沒有上限，建議留意每輪 log 裡的 `elite_archive` 數字。
-- `elite_archive_rank` 同時也是 reward 名次縮放的分母上限：數字越小，reward 在「前段
-  班」內的差異就被放大越多；數字越大，能容納的名次分佈越細，但每一階的 reward 差異會
-  被稀釋。`reward_scale_power`（預設 1.0 為線性）可以進一步把縮放曲線變成凹曲線
-  （`scale = linear_scale ** power`），在不改變 `elite_archive_rank` 的前提下，讓前幾名
-  之間的 reward 差距被放大、後段名次彼此更接近（但仍平滑遞減到 `reward_pass_base`，
-  不會斷崖式歸零）。
-- **`elite_archive_log_path`**：每一輪更新完 archive 之後，把 archive 目前保留的**全部**
-  分子（SMILES、各性質原始數值、archive 內部依 rank 排序後的名次）整批**覆蓋**寫進這份
-  CSV（不像 `front1_log_path` 是累積 append）——因為 archive 本身每輪都在更新，只需要
-  看最新狀態，不需要留存歷史 epoch 紀錄。
-
-### Reward 的絕對分量：解決「相對排名只會越來越嚴格」的問題
-
-`elite_archive` 讓 reward 能反映「有沒有比歷史最好的分子更好」，但這個機制本質上是**相對**
-的：訓練前期 archive 還弱，容易拿到好名次；中期之後 archive 累積了很多歷史強分子，門檻越墊
-越高，越來越多分子的 reward 卡在同一個 `reward_pass_base`（不管實際上離目標多近多遠都一樣），
-REINFORCE 的 advantage（reward - batch 內平均）跟著趨近於零、梯度訊號消失。
-
-主流 REINVENT 系列（Olivecrona et al. 2017; Blaschke et al. 2020）的做法不同：reward 是
-**絕對**的（每個性質各自的 desirability 轉換函式固定不變，不會因為訓練進度改變）。
-`reward_absolute_weight > 0` 時，`_score_batch` 會額外算一個不受 `elite_archive` 狀態影響
-的絕對分量，跟原本的相對分量混合：
-
-```
-combined_scale = reward_absolute_weight * absolute_desirability + (1 - reward_absolute_weight) * relative_scale
-reward = reward_pass_base + (reward_pass_max - reward_pass_base) * combined_scale
-```
-
-絕對分量的計算（`_compute_absolute_desirability`）：對每個性質，把 `PropertySpec.to_objective()`
-算出的距離值轉成 z-score，再取指數：
+主流 REINVENT 系列（Olivecrona et al. 2017; Blaschke et al. 2020）的 reward 是**絕對**的：
+每個性質各自的 desirability 轉換函式固定不變，不會因為訓練進度改變。`reinvent_lm` 的
+reward 完全採用這個做法，`_compute_absolute_desirability` 對每個性質，把
+`PropertySpec.to_objective()` 算出的距離值轉成 z-score，再取指數：
 
 ```
 z = (to_objective(value) - mean_ref) / std_ref
 desirability_i = exp(-max(z, 0))
+reward = reward_pass_base + (reward_pass_max - reward_pass_base) * (prod_i desirability_i) ** (1/M)
 ```
 
 `mean_ref`/`std_ref` 是**固定的**正規化基準（`_compute_reward_normalization_stats`），
 在 warmup 結束、`_snapshot_prior()` 之後只計算這一次：從 prior model 大量取樣
 （`reward_normalization_num_samples` 個分子）、過 `filter_api`、用 `inference_api` 算性質，
-統計每個性質 `to_objective()` 距離的平均值/標準差。之後整個訓練過程都固定不變，不會像
-`elite_archive` 那樣隨訓練漂移——這正是這個機制存在的意義。`max(z, 0)` 讓「比 prior model
-自然產出的族群平均還好」的分子一律拿接近滿分，只有比平均差的部分才開始衰減；對 `range`
-型性質這樣設計特別合理，因為 prior model 隨機產出的分子多數會落在窄目標區間外，`mean_ref`
-通常是正數，一個真的落在區間內的分子（`to_objective=0`）自然會拿到 `z<0`、被夾到
-`0`、`desirability=1`。
+統計每個性質 `to_objective()` 距離的平均值/標準差。之後整個訓練過程都固定不變，不會隨
+訓練往下漂移——這正是「絕對」的意義：不管訓練跑到多後期、模型生成的分子有多集中，同一個
+分子永遠拿到同一個 reward。`max(z, 0)` 讓「比 prior model 自然產出的族群平均還好」的分子
+一律拿接近滿分，只有比平均差的部分才開始衰減；對 `range` 型性質這樣設計特別合理，因為
+prior model 隨機產出的分子多數會落在窄目標區間外，`mean_ref` 通常是正數，一個真的落在
+區間內的分子（`to_objective=0`）自然會拿到 `z<0`、被夾到 `0`、`desirability=1`。
 
-多個性質的 `desirability_i` 用**幾何平均**合併成單一絕對分數（不是算術平均）：任一性質
-嚴重沒達標時，整體分數會被拉低，不會被其他性質平均掉——這也是 REINVENT 官方組合多個
-scoring component 時的慣例做法。
+多個性質的 `desirability_i`（`M` 個性質）用**幾何平均**合併成單一絕對分數（不是算術
+平均）：任一性質嚴重沒達標時，整體分數會被拉低，不會被其他性質平均掉——這也是 REINVENT
+官方組合多個 scoring component 時的慣例做法。
 
-`reward_absolute_weight` 預設 `0.0`，完全維持原本純相對排名的行為；`configs/train_reinvent_property_guided.yaml`
-教學設定檔目前示範設成 `1.0`（完全不看 `elite_archive` 的相對名次），方便單獨驗證這個
-機制本身的效果。校準樣本數（過 `filter_api` 後）不足 30 個時會印警告並自動停用絕對分量
-（等同 `reward_absolute_weight=0`），不會讓訓練中斷。每輪印出的統計行會多一個
-`abs_desirability` 欄位，可以用來監看這個分量的實際數值。
+校準樣本數（過 `filter_api` 後）不足 30 個時會印警告，`reward_norm_mean`/`reward_norm_std`
+保持 `None`，這個 epoch 之後所有合規分子的絕對 desirability 都視為 0（reward 一律退化
+成 `reward_pass_base`），不會讓訓練中斷。每輪印出的統計行有一個 `abs_desirability`
+欄位，可以用來監看這個分數的實際數值。
 
-### 訓練後期的停滯問題與 Archive 清理
+### Elite Archive：事後分析用的歷史紀錄
 
-`elite_archive` 穩定下來後（尤其目標是多個窄範圍 `range` 同時達標時），新採樣的分子會
-很難再贏過/打平 archive 現有的成員，導致大部分分子的 pareto rank 都掉到
-`elite_archive_rank` 之外，只能拿到同一個 `reward_pass_base`——這一批的 reward 變異數
-會急遽下降，REINFORCE 的 `advantage = reward - batch_mean` 對大部分樣本趨近於 0，
-訓練表面上還在跑，實際上梯度訊號幾乎消失。
+`elite_archive` 是一個小型 buffer（`canonical_smiles -> {smiles, objective, properties}`），
+**純粹讓你事後分析「這個生成器最終找到哪些好分子」，完全不影響上面的 reward 計算或訓練**：
 
-`_check_and_prune_elite_archive_on_stagnation`（每個 epoch 結束後執行一次）用一個簡單
-的機制緩解這個問題：
-
-1. 追蹤 archive 裡第 `archive_stagnation_watch_rank` 層（預設 `1`，也就是 rank 1／
-   「front 2」）的分子集合，如果連續 `archive_stagnation_patience_epochs` 個 epoch
-   都跟上一次記錄的集合完全相同，就判定為停滯。
-   > 為什麼不盯 rank 0（front 1）：rank 0 是最難改善的一層，就算 archive 其他部分還在
-   > 活躍競爭、持續有進步，rank 0 本身很可能好一陣子都不會變（正常現象，不代表停滯），
-   > 拿它當觸發條件容易太早/太常誤判。
-2. 一旦判定停滯，把 archive 清到只剩 `rank < archive_prune_keep_rank`（預設只留
-   rank 0）的分子，其餘全部清掉，然後把計數器歸零重新開始追蹤。因為 pareto rank 0 是
-   由「archive 裡最強的那些分子彼此的支配關係」決定的，清掉較弱的分子**不會**讓 rank 0
-   的門檻變低——降低的只是中段名次的競爭門檻，讓中段的改善重新可以被 reward 看見，而
-   不是全部卡在同一個 `reward_pass_base`。
-3. 每個 epoch 都會印一行狀態，方便觀察目前的停滯計數：
-   ```
-   Elite archive rank 1 連續 2/3 個 epoch 未更新
-   ⚠ 已觸發停滯清理：archive 清到只剩 rank < 1 的分子（8 -> 3 個分子），重新開放中段名次的競爭
-   ```
-
-**注意**：清理前後的 reward/`mean_reward` 數字不能直接比較——清理瞬間，同一個分子算出
-來的 rank（進而 reward）可能會突然變好，純粹是因為比較對象變少了，不是分子真的變強。
-比較可靠的做法是看 `elite_archive_log.csv`/`front1_log.csv` 裡實際的分子跟性質數值。
+- **記錄時**（`_rank_against_elite_archive`）：把這一輪通過結構檢查的分子跟 archive
+  目前的成員合併，一起做一次 pareto front 排序，取得「這一輪分子」相對於「目前為止看過
+  最好的一批分子」的名次——只用來決定要不要寫進 `front1_log`/`elite_archive_log`，
+  不會回頭影響這一輪已經算好的 reward。archive 是空的（訓練剛開始）時，會自然退化成
+  單純對這一輪分子排序。
+- **更新時**（`_update_elite_archive`，每輪結束後執行）：新分子併入 archive，全部重新
+  排序，**只保留 `rank < elite_archive_rank` 的所有分子**——是依 pareto rank 篩選，
+  不是固定數量，同一層裡不管有幾個分子都會全部留著。
+  > ⚠️ 注意：因為是依 rank 篩選，如果同一個 rank 內同時有很多分子打平（例如多個
+  > `range` 型性質都達標、在該維度上都壓到同一個最低目標值 0），archive 大小可能會
+  > 持續成長、沒有上限，建議留意每輪 log 裡的 `elite_archive` 數字（只影響
+  > `elite_archive_log.csv` 的檔案大小，不影響訓練本身）。
+- **`elite_archive_log_path`**：每一輪更新完 archive 之後，把 archive 目前保留的**全部**
+  分子（SMILES、各性質原始數值、archive 內部依 rank 排序後的名次）整批**覆蓋**寫進這份
+  CSV（不像 `front1_log_path` 是累積 append）——因為 archive 本身每輪都在更新，只需要
+  看最新狀態，不需要留存歷史 epoch 紀錄。
 
 ### 每輪印出的統計數字怎麼看
 
 ```
-[RL round 1/20] sampled=1024 valid=1020 pass_filter=180 front1=9 max_front=42 top5_fronts(1-5)=[9, 15, 22, 18, 20] dynamic_pool=3200 elite_archive=10 mean_reward=0.35 abs_desirability=0.62 loss_pg=-0.12 loss_prior=1.84
+[RL round 1/20] sampled=1024 valid=1020 pass_filter=180 front1=9 max_front=42 top5_fronts(1-5)=[9, 15, 22, 18, 20] elite_archive=10 mean_reward=0.35 abs_desirability=0.62 loss_pg=-0.12 loss_prior=1.84
 ```
 
 - `sampled` / `valid`：這輪取樣了幾個、其中幾個是 RDKit 能解析的合法分子
 - `pass_filter`：合法且通過 `structure_filter` 的數量
-- `front1`：通過結構檢查的分子裡，相對於 `elite_archive` 的 pareto rank 為 0 的數量
-- `max_front`：這一輪分子（相對於 `elite_archive` 合併排序後）出現過的最大 rank，訓練
-  後期這個數字如果變得很大（例如 50+），代表 reward 名次縮放被拉得很稀，是考慮調整
-  `elite_archive_rank`/`reward_scale_power` 的訊號
-- `top5_fronts(1-5)`：這一輪分子裡，rank 0～4（前五層）各自有幾個，比單看 `front1`
-  更能看出「差一點點」的分子有多少
-- `dynamic_pool`：目前動態訓練池累積的分子數（拿去訓練模型用）
-- `elite_archive`：目前 `elite_archive` 實際保留的分子數（只當 reward 比較基準用，
-  不會被拿去訓練模型；因為是依 rank 篩選、不是固定數量，這個數字沒有上限，需要留意）
-- `abs_desirability`：這一輪分子的絕對分量平均值（見「Reward 的絕對分量」一節），只有
-  `reward_absolute_weight > 0` 時才有意義，`= 0.0` 代表沒開啟或校準樣本不足而自動停用
+- `front1` / `max_front` / `top5_fronts(1-5)` / `elite_archive`：都是**純分析用**的
+  指標，反映相對於 `elite_archive` 的 pareto 名次分布，不影響 reward——`front1` 是
+  通過結構檢查的分子裡 rank 為 0 的數量；`max_front` 是這一輪出現過的最大 rank；
+  `top5_fronts(1-5)` 是 rank 0～4 各自有幾個，比單看 `front1` 更能看出「差一點點」的
+  分子有多少；`elite_archive` 是目前 archive 實際保留的分子數（因為是依 rank 篩選、
+  不是固定數量，這個數字沒有上限，需要留意）
+- `abs_desirability`：這一輪分子絕對 desirability 的平均值（見「Reward：絕對
+  desirability」一節），這是唯一直接決定 reward 的分量，`= 0.0` 代表校準樣本不足而
+  自動停用（合規分子一律只拿 `reward_pass_base`）
 - `mean_reward` / `loss_pg` / `loss_prior`：見上面流程說明。**如果 `loss_prior` 開始
   隨訓練不斷暴增（例如從個位數飆到幾萬幾十萬），通常代表模型已經嚴重偏離 warmup 時的
   樣子，是 mode collapse 的警訊**，可以考慮調高 `prior_kl_weight`、拉長 `warmup_epochs`，
   或檢查 reward 是否過於稀疏（`pass_filter` 長期趨近 0 也是同一類警訊）。
-- 每個 epoch 結束後還會多印一行 `Elite archive rank N 連續 X/M 個 epoch 未更新`，是
-  停滯偵測的計數狀態，細節見上面「訓練後期的停滯問題與 Archive 清理」。
 
 ---
 
@@ -726,7 +630,7 @@ API 重置的殘留狀態），而是改用「本地 `random.Random(seed)` 決�
 `Chem.RenumberAtoms` 實際重新編號 → `canonical=False`（不用任何 RNG）寫出 SMILES」這個
 組合，只依賴呼叫者自己算出的 `seed` 值，不依賴任何全域/跨行程共享的 RNG 狀態。
 
-`dataset.py` 的 `SmilesLMDataset`/`DynamicSmilesLMDataset` 建構時吃一個 `seed` 參數，
+`dataset.py` 的 `SmilesLMDataset` 建構時吃一個 `seed` 參數，
 `__getitem__(idx)` 會用 `(seed, 目前 epoch, idx)` 三者混合出這個 item 專屬的 seed
 （`seed_utils.derive_seed`，內部用 `numpy.random.SeedSequence` 做混合），並提供
 `set_epoch(epoch)` 方法（`Trainer.train_epoch()` 每個 epoch 開始都會呼叫一次）讓同一個
@@ -736,7 +640,7 @@ API 重置的殘留狀態），而是改用「本地 `random.Random(seed)` 決�
 在 `num_workers > 0` 時最容易踩的雷（worker fork 會複製當下的全域 RNG 狀態，PyTorch
 只會自動幫 `torch` 自己的 RNG 依 worker 分別重新 seed，不會處理 `random`/`numpy`/RDKit）。
 `training.py` 也額外把 `persistent_workers` 鎖在 `False`（worker 每個 epoch 重新 fork，
-才能保證看到 RL 動態訓練池 `set_dynamic_smiles()` 的最新內容）並在 `num_workers > 0`
+才能保證看到 main process 呼叫 `set_epoch()` 更新的最新 `_epoch` 值）並在 `num_workers > 0`
 時掛上 `worker_init_fn=seed_utils.seed_worker`（防禦性補強，防止其他程式碼在 worker
 裡用到全域隨機性）。
 

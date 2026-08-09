@@ -95,45 +95,6 @@ class SmilesLMDataset(Dataset):
         return randomize_smiles(smiles, seed=item_seed)
 
 
-class DynamicSmilesLMDataset(Dataset):
-    """
-    訓練過程中內容可以動態調整的 SMILES Dataset（給 property-guided RL 微調用）。
-
-    - base_smiles：固定不變的真實訓練資料
-    - dynamic_smiles：由外部（PropertyGuidedLMTrainer）整批替換的動態資料，
-      用來讓「訓練過程中新發現的優質分子」持續存在於訓練資料中。
-    - randomize：跟 SmilesLMDataset 意義相同，對 base_smiles 跟 dynamic_smiles 都適用。
-    """
-
-    def __init__(self, base_smiles: List[str], randomize: bool = False, seed: int = 0):
-        self.base_smiles = list(base_smiles)
-        self.dynamic_smiles: List[str] = []
-        self.randomize = randomize
-        self.seed = seed
-        self._epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        """見 SmilesLMDataset.set_epoch()。"""
-        self._epoch = epoch
-
-    def set_dynamic_smiles(self, smiles_list: List[str]) -> None:
-        """整批覆蓋目前的動態資料（呼叫端已經決定好要保留哪些分子）"""
-        self.dynamic_smiles = list(smiles_list)
-
-    def __len__(self) -> int:
-        return len(self.base_smiles) + len(self.dynamic_smiles)
-
-    def __getitem__(self, idx: int) -> str:
-        if idx < len(self.base_smiles):
-            smiles = self.base_smiles[idx]
-        else:
-            smiles = self.dynamic_smiles[idx - len(self.base_smiles)]
-        if not self.randomize:
-            return canonicalize_smiles(smiles)
-        item_seed = derive_seed(self.seed, self._epoch, idx)
-        return randomize_smiles(smiles, seed=item_seed)
-
-
 def collate_fn(
     batch: List[str],
     tokenizer: SmilesTokenizer,
@@ -204,12 +165,6 @@ if __name__ == "__main__":
     print(f"input_seq shape: {input_seq.shape}")
     print(f"target_seq shape: {target_seq.shape}")
     assert input_seq.shape == target_seq.shape == (4, 20)
-
-    dynamic_dataset = DynamicSmilesLMDataset(smiles_samples)
-    assert len(dynamic_dataset) == 4
-    dynamic_dataset.set_dynamic_smiles(["CCCC", "CCCCC"])
-    assert len(dynamic_dataset) == 6
-    print(f"dynamic_dataset[5] = {dynamic_dataset[5]}")
 
     # randomize=True：每次取用都應該是合法、可被 RDKit 解析的同一個分子的某種書寫法
     from rdkit import Chem
