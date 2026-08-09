@@ -92,10 +92,10 @@ property_guided:
   reward_normalization_num_samples: 5000
 
   # Reward 設定：無效分子 < 結構不合規 < 合規但性質差 < 合規且絕對 desirability 最好
-  reward_invalid: -2.0
+  reward_invalid: -3.0
   reward_structure_fail: -1.0
   reward_pass_base: 1.0
-  reward_pass_max: 6.0
+  reward_pass_max: 3.0
 
   # Prior regularization 權重，防止 RL 微調時生成多樣性崩潰 (mode collapse)
   prior_kl_weight: 0.5
