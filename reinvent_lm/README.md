@@ -522,6 +522,33 @@ Agent 微調階段的做法一致：`prior_kl_weight` 正則化已經承擔了�
 6. **更新 Elite Archive**（`_update_elite_archive`）與寫入快照（`_log_elite_archive_snapshot`）：
    細節見下方獨立小節。**這兩步都只是紀錄，不影響上面第 2 步已經算好的 reward。**
 
+### Reward 怎麼變成 loss（REINFORCE 的核心直覺）
+
+`reward` 本身不是 loss、也不直接參與微分，它只是拿來決定「該把某個生成序列的機率調高
+還是調低、調多用力」的權重。真正被反向傳播的是模型對自己剛剛採樣出來的序列重新算出的
+log 機率 `seq_logp`（`_sequence_log_prob`）。完整換算（對應上面第 3、4 步）：
+
+```
+advantage_i = reward_i - mean(reward)                    # 這一輪 batch 自己的平均，當 baseline
+seq_logp_i  = sum_t log p_theta(token_t | token_<t)        # teacher forcing 重新算一次，可微分
+loss_pg     = -mean(advantage_i * seq_logp_i)              # REINFORCE policy gradient
+loss_prior  = mean((seq_logp_i - prior_seq_logp_i)^2)       # 跟凍結 prior 的差距
+loss_rl     = loss_pg + prior_kl_weight * loss_prior
+```
+
+- **為什麼要減掉 batch 平均，不直接用原始 reward？** 這是標準的 baseline 做法：如果直接
+  用原始 reward（例如全部都是正的 `1.0~5.0`），loss 會讓模型對「每一個」生成過的分子都
+  調高機率、只是幅度不同，訊號很模糊。減掉這一輪自己的平均之後，`advantage` 才是乾淨的
+  「比這批平均好就推高機率、比平均差就壓低機率」的相對訊號，數學上不偏，還能降低梯度
+  估計的變異數，訓練更穩定。
+- **reward 的絕對數值怎麼影響訓練？** 只有**相對大小**（減完平均後的正負與大小）決定
+  梯度方向；`reward_invalid`/`reward_structure_fail`/`reward_pass_base`/`reward_pass_max`
+  彼此的**間距（span）**則決定梯度量級——間距越大、`loss_pg` 的量級越大，`prior_kl_weight`
+  要拉住它的力道也要跟著考慮，不然容易 mode collapse（見下一點）。
+- **`loss_prior` 的角色**：單純追 `loss_pg` 容易讓模型找到幾種套路的分子結構就一直重複
+  生成來騙 reward（多樣性崩潰）；`loss_prior` 把模型的生成分布拉回靠近 warmup 結束時凍結
+  的 prior model，`prior_kl_weight` 就是這條橡皮筋的鬆緊程度。
+
 ### Reward：絕對 desirability
 
 主流 REINVENT 系列（Olivecrona et al. 2017; Blaschke et al. 2020）的 reward 是**絕對**的：
