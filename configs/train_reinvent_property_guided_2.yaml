@@ -56,7 +56,10 @@ device:
 
 # 隨機種子：固定這個值後，訓練資料切分/洗牌、SMILES randomize 增強、模型初始化、
 # dropout、RL 採樣都會是同一個 seed 的 deterministic 函式，重跑應該得到一致的結果
-# （見 device.deterministic_cuda 的 GPU 限制說明）
+# （見 device.deterministic_cuda 的 GPU 限制說明）。填 null 則完全不呼叫 set_seed，
+# 訓練維持 PyTorch/numpy/random 各自預設（用 OS entropy 初始化）的非固定隨機行為，
+# 不保證可重現——主要用來排查「訓練結果看起來被固定 seed 卡住/每次都一樣」時，
+# 先確認問題是否真的跟 seeding 有關。
 
 # 隨機種子
 seed: 42
@@ -111,14 +114,15 @@ property_guided:
     desired_smarts:
       - "[C](=[O])-[N]"
       - "c1ccccc1"
+      - "c1ccsc1"
     require_all_desired: true
 
   # 分子性質目標 (target_spec)
   target_spec:
     ClogP:
-      goal: maximize #range
-      # low: 5.0
-      # high: 6.5
+      goal: range
+      low: 6.0
+      high: 7.5
     SAScore:
       goal: range
       low: 1.5

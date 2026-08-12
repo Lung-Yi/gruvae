@@ -220,9 +220,15 @@ def main(config_path='configs/train_reinvent.yaml'):
     config = load_config(config_path)
     print(f"配置載入成功!\n")
 
-    seed = config['seed']
+    # seed: null（或 config 完全沒有這個 key）時，完全不呼叫 set_seed，維持 PyTorch/
+    # numpy/random 各自預設（用 OS entropy 初始化，不保證可重現）的隨機行為——用來
+    # 排除「訓練結果看起來像被固定 seed 卡住」時，先確認問題是否跟 seeding 有關
+    seed = config.get('seed')
     deterministic_cuda = config['device'].get('deterministic_cuda', True)
-    set_seed(seed, deterministic_cuda=deterministic_cuda)
+    if seed is not None:
+        set_seed(seed, deterministic_cuda=deterministic_cuda)
+    else:
+        print("seed 為 null，本次執行不會呼叫 set_seed，重跑結果不保證可重現\n")
 
     use_cuda = config['device']['use_cuda']
     device = torch.device('cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu')

@@ -48,5 +48,8 @@ device:
 
 # 隨機種子：固定這個值後，訓練資料切分/洗牌、SMILES randomize 增強、模型初始化、
 # dropout、RL 採樣（property_guided 開啟時）都會是同一個 seed 的 deterministic 函式，
-# 重跑應該得到一致的結果（見 device.deterministic_cuda 的 GPU 限制說明）
+# 重跑應該得到一致的結果（見 device.deterministic_cuda 的 GPU 限制說明）。
+# 填 null 則完全不呼叫 set_seed，訓練維持 PyTorch/numpy/random 各自預設（用 OS
+# entropy 初始化）的非固定隨機行為，不保證可重現——主要用來排查「訓練結果看起來
+# 被固定 seed 卡住/每次都一樣」時，先確認問題是否真的跟 seeding 有關。
 seed: 42

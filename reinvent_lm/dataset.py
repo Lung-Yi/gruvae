@@ -44,7 +44,7 @@ class SmilesLMDataset(Dataset):
         max_length: Optional[int] = None,
         smiles_list: Optional[List[str]] = None,
         randomize: bool = False,
-        seed: int = 0,
+        seed: Optional[int] = None,
     ):
         """
         Args:
@@ -56,7 +56,9 @@ class SmilesLMDataset(Dataset):
             seed: randomize=True 時，`(seed, epoch, idx)` 會被混合成該 item 的專屬
                 隨機化 seed（見 __getitem__），讓結果不依賴 DataLoader worker 數量/
                 行程排程，只要三者相同就一定重現同一個結果。搭配 set_epoch() 使用，
-                讓同一個分子在不同 epoch 仍然拿到不同的隨機書寫法。
+                讓同一個分子在不同 epoch 仍然拿到不同的隨機書寫法。填 None（預設）時，
+                改走 randomize_smiles(seed=None) 的非重現路徑（RDKit 全域內部 RNG，
+                不保證可重現），對應 config 頂層 `seed: null`。
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -91,6 +93,8 @@ class SmilesLMDataset(Dataset):
         smiles = self.smiles_list[idx]
         if not self.randomize:
             return canonicalize_smiles(smiles)
+        if self.seed is None:
+            return randomize_smiles(smiles, seed=None)
         item_seed = derive_seed(self.seed, self._epoch, idx)
         return randomize_smiles(smiles, seed=item_seed)
 

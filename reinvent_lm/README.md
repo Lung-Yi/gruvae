@@ -635,10 +635,29 @@ prior model 隨機產出的分子多數會落在窄目標區間外，`mean_ref` 
 `front1_log.csv`/`elite_archive_log.csv` 內容、以及最終 checkpoint 的權重張量都已經
 實測驗證過完全一致（`num_workers=0` 與 `num_workers>0` 分別驗證過，GPU 上也驗證過）。
 
+### `seed: null`：關掉固定 seed
+
+config 頂層的 `seed` 填 `null`（或整個省略這個 key）時，`training.py::main()` 完全不會
+呼叫 `set_seed()`，訓練維持 PyTorch/numpy/random 各自預設（用 OS entropy 初始化）的
+非固定隨機行為，重跑不保證可重現。`SmilesLMDataset` 也會跟著改用
+`randomize_smiles(seed=None)` 的非重現路徑（RDKit 全域內部 RNG），不會再用
+`(seed, epoch, idx)` 混合出的 per-item seed。
+
+主要用途是排查問題：如果訓練看起來被「卡住」（例如 RL 每一輪 sample 出來的分子都一樣），
+先把 `seed` 改成 `null` 重跑一次——固定 seed 的程式碼路徑（`set_seed`/`derive_seed`/
+`model.sample(seed=...)`）在目前的實作裡**只有 `training.py::main()` 開頭呼叫過一次**，
+`run_rl_round()` 呼叫 `model.sample()` 時完全沒有傳 `seed`，所以正常情況下不會有「每一輪
+都重新種同一個 seed」這種 bug。如果改成 `seed: null` 之後，同樣的「每輪都採到一模一樣的
+分子」現象依然存在，就可以排除是 seeding 的問題（見上一段的說明），通常代表模型的輸出分布已經崩潰成
+接近確定性（softmax 被壓到只有一兩個 token 機率接近 1，multinomial 取樣起不了作用），
+是 mode collapse，而不是 RNG 被重置——這種情況下該調的是 `prior_kl_weight`／reward
+tier 的間距（見上面「Reward 怎麼變成 loss」與「每輪印出的統計數字怎麼看」兩節），不是
+seed。
+
 ### 涵蓋的隨機源（`reinvent_lm/seed_utils.py`）
 
-`training.py::main()` 開頭會呼叫一次 `seed_utils.set_seed(seed, deterministic_cuda=...)`，
-統一種好：
+`training.py::main()` 開頭（`seed` 不是 `null` 時）會呼叫一次
+`seed_utils.set_seed(seed, deterministic_cuda=...)`，統一種好：
 
 - `random` / `numpy` / `torch`（`torch.manual_seed` 會連帶種到 CPU 與所有 CUDA device）
 - `deterministic_cuda=True`（`device.deterministic_cuda`，預設開啟）時，額外設定
