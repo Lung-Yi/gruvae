@@ -50,13 +50,11 @@ checkpoint:
 # 設備設定
 device:
   use_cuda: true
-  # GPU 上是否額外開啟 cuDNN deterministic 模式，讓相同 seed 重跑訓練時 GPU 上的
-  # 結果也能盡量 bit-exact 重現（詳細說明見 configs/train_reinvent.yaml）。預設開啟。
-  deterministic_cuda: true
 
 # 隨機種子：固定這個值後，訓練資料切分/洗牌、SMILES randomize 增強、模型初始化、
-# dropout、RL 採樣都會是同一個 seed 的 deterministic 函式，重跑應該得到一致的結果
-# （見 device.deterministic_cuda 的 GPU 限制說明）。填 null 則完全不呼叫 set_seed，
+# dropout、RL 採樣都會是同一個 seed 的 deterministic 函式，重跑應該得到一致的結果；
+# GPU 上牽涉 cuDNN 卷積/RNN 的計算路徑不強制 deterministic 模式，不保證 bit-exact
+# （見 seed_utils.py 開頭的說明，實測過強制開啟弊大於利）。填 null 則完全不呼叫 set_seed，
 # 訓練維持 PyTorch/numpy/random 各自預設（用 OS entropy 初始化）的非固定隨機行為，
 # 不保證可重現——主要用來排查「訓練結果看起來被固定 seed 卡住/每次都一樣」時，
 # 先確認問題是否真的跟 seeding 有關。

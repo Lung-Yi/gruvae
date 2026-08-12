@@ -432,8 +432,7 @@ print(generator.sample_from_prefix("CCOc1ccccc1", num_samples=5))
 | | `save_interval` | 每幾個 epoch 存一次 `checkpoint_epoch_N.pt`（另外 val loss 創新低時都會存 `best_model.pt`） |
 | | `load_from` | (可選) 之前訓練好的 `.pt` 路徑，設定後會先載入該權重繼續訓練/微調；同時會自動嘗試載入**同目錄下**的 `tokenizer.json` 以確保詞彙表一致（詞彙表不一致的話，權重的 embedding/輸出層索引會完全對不上，模型會壞掉） |
 | `device` | `use_cuda` | 是否使用 CUDA（不可用時自動退回 CPU） |
-| | `deterministic_cuda` | 預設 `true`。GPU 上額外開啟 cuDNN deterministic 模式，讓相同 seed 重跑訓練時 GPU 結果也能盡量 bit-exact 重現，見下方「可復現性 (seed)」一節 |
-| 頂層 | `seed` | 隨機種子，`reinvent_lm.seed_utils.set_seed()` 會統一種好 `torch`/`numpy`/`random`/RDKit，見下方「可復現性 (seed)」一節 |
+| 頂層 | `seed` | 隨機種子，`reinvent_lm.seed_utils.set_seed()` 會統一種好 `torch`/`numpy`/`random`/RDKit；填 `null` 則不呼叫，見下方「可復現性 (seed)」一節 |
 
 ### `configs/train_reinvent_property_guided.yaml`（RL 微調）
 
@@ -630,10 +629,29 @@ prior model 隨機產出的分子多數會落在窄目標區間外，`mean_ref` 
 ## 可復現性 (seed)
 
 固定 config 頂層的 `seed` 之後，純預訓練跟 property-guided RL 微調（含 `num_workers > 0`）
-重跑應該得到 bit-exact 一致的結果：每個 epoch 的 train/val loss、驗證階段自回歸生成的
-分子、RL 每輪的 `sampled`/`pass_filter`/`front1`/`mean_reward`/`loss_pg`/`loss_prior`、
-`front1_log.csv`/`elite_archive_log.csv` 內容、以及最終 checkpoint 的權重張量都已經
-實測驗證過完全一致（`num_workers=0` 與 `num_workers>0` 分別驗證過，GPU 上也驗證過）。
+在 **CPU** 上重跑應該得到 bit-exact 一致的結果（train/val loss、驗證階段自回歸生成的
+分子、RL 每輪的統計數字、`front1_log.csv`/`elite_archive_log.csv` 內容、最終 checkpoint
+權重都實測驗證過完全一致）。**GPU 上刻意不強制 deterministic 模式**（原因見下方「涵蓋的
+隨機源」一節），數值結果會非常接近但不保證 bit-exact；`randomize_smiles`/`derive_seed`
+這類跟 GPU 運算無關、純 CPU 端的隨機邏輯（訓練資料切分/洗牌、SMILES enumeration）不受
+影響，仍然是 bit-exact 可重現的。
+
+### 涵蓋的隨機源（`reinvent_lm/seed_utils.py`）
+
+`training.py::main()` 開頭（`seed` 不是 `null` 時）會呼叫一次 `seed_utils.set_seed(seed)`，
+統一種好 `random` / `numpy` / `torch`（`torch.manual_seed` 會連帶種到 CPU 與所有 CUDA
+device）/ RDKit。
+
+**這裡刻意不提供 cuDNN deterministic 模式的開關**（曾經有過 `deterministic_cuda` 這個
+config 選項，已經移除）：實測發現在某些 torch/cuDNN/GPU 組合下，開啟
+`torch.use_deterministic_algorithms(True, warn_only=True)` 後，RL 訓練 `run_rl_round()`
+每一輪用 `model.sample()` 取樣出來的分子，會出現「同一個 batch index 每一輪都固定生成
+同一個分子、順序也一樣」的異常現象（而且不是模型輸出分布崩潰造成的：同一輪 batch 內部
+仍然有明顯的分子多樣性，只是跨輪次的同一個 index 位置卡住不變）——懷疑是這個模式底下
+`torch.multinomial` 的 CUDA 實作，在特定版本組合下對「哪個 index 用哪一段隨機數」的
+處理方式跟預期不同。這個問題只在部分機器上重現、不容易在單一環境下穩定驗證根因，考量到
+開啟 deterministic 模式本來就有效能代價、又只能 best-effort（cuDNN 某些 op 即使開了也
+不保證 bit-exact），權衡下**固定不開啟**，不再讓它成為使用者需要自行判斷的參數。
 
 ### `seed: null`：關掉固定 seed
 
@@ -644,27 +662,15 @@ config 頂層的 `seed` 填 `null`（或整個省略這個 key）時，`training
 `(seed, epoch, idx)` 混合出的 per-item seed。
 
 主要用途是排查問題：如果訓練看起來被「卡住」（例如 RL 每一輪 sample 出來的分子都一樣），
-先把 `seed` 改成 `null` 重跑一次——固定 seed 的程式碼路徑（`set_seed`/`derive_seed`/
-`model.sample(seed=...)`）在目前的實作裡**只有 `training.py::main()` 開頭呼叫過一次**，
-`run_rl_round()` 呼叫 `model.sample()` 時完全沒有傳 `seed`，所以正常情況下不會有「每一輪
-都重新種同一個 seed」這種 bug。如果改成 `seed: null` 之後，同樣的「每輪都採到一模一樣的
-分子」現象依然存在，就可以排除是 seeding 的問題（見上一段的說明），通常代表模型的輸出分布已經崩潰成
-接近確定性（softmax 被壓到只有一兩個 token 機率接近 1，multinomial 取樣起不了作用），
-是 mode collapse，而不是 RNG 被重置——這種情況下該調的是 `prior_kl_weight`／reward
-tier 的間距（見上面「Reward 怎麼變成 loss」與「每輪印出的統計數字怎麼看」兩節），不是
-seed。
-
-### 涵蓋的隨機源（`reinvent_lm/seed_utils.py`）
-
-`training.py::main()` 開頭（`seed` 不是 `null` 時）會呼叫一次
-`seed_utils.set_seed(seed, deterministic_cuda=...)`，統一種好：
-
-- `random` / `numpy` / `torch`（`torch.manual_seed` 會連帶種到 CPU 與所有 CUDA device）
-- `deterministic_cuda=True`（`device.deterministic_cuda`，預設開啟）時，額外設定
-  `torch.backends.cudnn.deterministic = True`、`benchmark = False`，並開啟
-  `torch.use_deterministic_algorithms(True, warn_only=True)`。**已知限制**：極少數
-  cuDNN 版本下 GRU backward 仍可能無法保證 100% bit-exact，這是 PyTorch/cuDNN 本身的
-  限制，這裡採 best-effort，不強行解決。
+可以先把 `seed` 改成 `null` 重跑一次排除 seeding 相關的疑慮——固定 seed 的程式碼路徑
+（`set_seed`/`derive_seed`/`model.sample(seed=...)`）在目前的實作裡**只有
+`training.py::main()` 開頭呼叫過一次**，`run_rl_round()` 呼叫 `model.sample()` 時完全
+沒有傳 `seed`，所以正常情況下不會有「每一輪都重新種同一個 seed」這種 bug。如果這個現象
+還是不是上面說的「GPU deterministic 模式」造成的（已經固定關閉），也不是外部有東西重新
+啟動了整個訓練 process（可以檢查 log 裡有沒有重複出現 `main()` 開頭的初始化訊息），
+那就要往「模型輸出分布本身已經塌縮」（mode collapse）的方向排查，該調的是
+`prior_kl_weight`／reward tier 的間距（見上面「Reward 怎麼變成 loss」與「每輪印出的
+統計數字怎麼看」兩節），不是 seed。
 
 ### `randomize_smiles`（SMILES enumeration 資料增強）跟 `num_workers > 0` 的相容性
 
@@ -711,7 +717,8 @@ mols_c = generator.sample(10)    # 不傳 seed：維持原本每次呼叫都不�
   `history`，不含當下的 RNG 狀態。從 checkpoint 恢復訓練會讓隨機序列從
   `set_seed()` 重新開始，不等於「沒中斷地跑完整段訓練」的結果（這是常見 ML 框架的
   通用限制，這裡沒有特別處理）。
-- **GPU determinism 為 best-effort**：見上面 `deterministic_cuda` 的說明。
+- **GPU 上不強制 deterministic 模式**：見上面「涵蓋的隨機源」一節的說明，GPU 上的數值
+  結果不保證 bit-exact。
 
 ---
 

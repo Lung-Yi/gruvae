@@ -1,10 +1,14 @@
 """
 集中管理可復現性 (reproducibility) 相關的 seeding 工具。
 
-涵蓋 torch / numpy / random / RDKit 四個隨機源，以及（可選的）GPU 上 cuDNN 的
-determinism 設定。`reinvent_lm/` 底下需要固定隨機性的地方（training.py 的
-main()、DataLoader 的 worker_init_fn、MoleculeGenerator/SmilesLM 的 sample 系列
-方法）都透過這個模組共用同一套邏輯，避免各處各自 inline 一份不完整的版本。
+涵蓋 torch / numpy / random / RDKit 四個隨機源。`reinvent_lm/` 底下需要固定隨機性的
+地方（training.py 的 main()、DataLoader 的 worker_init_fn、MoleculeGenerator/SmilesLM
+的 sample 系列方法）都透過這個模組共用同一套邏輯，避免各處各自 inline 一份不完整的版本。
+
+刻意不提供 cuDNN deterministic 模式的開關：實測下來 `torch.use_deterministic_algorithms`
+在部分 torch/cuDNN/GPU 組合下，會讓 `torch.multinomial` 這類取樣 op 的隨機性出現不該有
+的規律性（懷疑跟 per-row 的 RNG offset 有關），弊大於它原本想換到的 bit-exact 可重現性，
+所以固定不開啟，也不讓它成為使用者需要自行判斷的參數。
 """
 
 import random
@@ -15,7 +19,7 @@ import torch
 from rdkit import rdBase
 
 
-def set_seed(seed: int, deterministic_cuda: bool = True) -> None:
+def set_seed(seed: int) -> None:
     """
     把 random / numpy / torch（CPU + CUDA）/ RDKit 的全域 RNG 都種到同一個 seed。
 
@@ -27,21 +31,14 @@ def set_seed(seed: int, deterministic_cuda: bool = True) -> None:
     `reinvent_lm.tokenizer.randomize_smiles(seed=...)` 真正的可重現性保證來自
     它自己內部用的本地 `random.Random(seed)` 實例（見該函式的說明），不依賴這裡。
 
-    deterministic_cuda=True 時，額外把 cuDNN 設成 deterministic 模式（關掉
-    benchmark 自動調參）並開啟 `torch.use_deterministic_algorithms(warn_only=True)`
-    ——這是 PyTorch 官方建議的 best-effort 做法：極少數沒有 deterministic CUDA
-    實作的 op 只會印警告，不會直接噴例外。GPU 上的 RNN backward 在少數 cuDNN
-    版本下仍可能無法保證 100% bit-exact，這是已知限制，這裡不強行解決。
+    不會動 cuDNN/`torch.use_deterministic_algorithms` 這類 GPU 上的 determinism 設定
+    （原因見本檔案開頭的說明）：CPU 上、以及 GPU 上不牽涉那些 op 的部分仍然是同一個
+    seed 可重現，但 GPU 上牽涉 cuDNN 卷積/RNN 等 op 的計算路徑不保證 bit-exact。
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     rdBase.SeedRandomNumberGenerator(seed)
-
-    if deterministic_cuda and torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def derive_seed(*values: int) -> int:
